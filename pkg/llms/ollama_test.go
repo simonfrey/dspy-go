@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	ollamaapi "github.com/ollama/ollama/api"
+
 	"github.com/XiaoConstantine/dspy-go/pkg/core"
 	"github.com/XiaoConstantine/dspy-go/pkg/llms/openai"
 	"github.com/stretchr/testify/assert"
@@ -141,10 +143,10 @@ func TestOllamaLLM_DualModeGeneration(t *testing.T) {
 			name:         "Native mode",
 			useOpenAI:    false,
 			expectedPath: "/api/generate",
-			mockResponse: &ollamaResponse{
-				Model:     "llama3:8b",
-				CreatedAt: "2023-01-01T00:00:00Z",
-				Response:  "Native response",
+			mockResponse: &ollamaapi.GenerateResponse{
+				Model:    "llama3:8b",
+				Response: "Native response",
+				Done:     true,
 			},
 			options: []core.GenerateOption{core.WithMaxTokens(100), core.WithTemperature(0.7)},
 		},
@@ -172,17 +174,22 @@ func TestOllamaLLM_DualModeGeneration(t *testing.T) {
 					assert.NotNil(t, req.Temperature)
 					assert.Equal(t, 0.7, *req.Temperature)
 				} else {
-					// Verify native request format
-					var req ollamaRequest
+					// Verify native request format. The official ollama Go SDK
+					// nests sampling settings under "options" with their native
+					// keys ("num_predict" for max tokens), so decode into the
+					// SDK type and inspect that map.
+					var req ollamaapi.GenerateRequest
 					err := json.NewDecoder(r.Body).Decode(&req)
 					assert.NoError(t, err)
 					assert.Equal(t, "llama3:8b", req.Model)
 					assert.Equal(t, "Test prompt", req.Prompt)
-					assert.False(t, req.Stream)
-					assert.Equal(t, 100, req.MaxTokens)
-					assert.Equal(t, 0.7, req.Temperature)
+					require.NotNil(t, req.Stream)
+					assert.False(t, *req.Stream)
+					assert.Equal(t, float64(100), req.Options["num_predict"])
+					assert.Equal(t, 0.7, req.Options["temperature"])
 				}
 
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				if err := json.NewEncoder(w).Encode(tt.mockResponse); err != nil {
 					t.Fatalf("Failed to encode response: %v", err)
@@ -282,10 +289,11 @@ func TestOllamaLLM_DualModeStreaming(t *testing.T) {
 					flusher.Flush()
 				} else {
 					// Verify native streaming request
-					var req ollamaRequest
+					var req ollamaapi.GenerateRequest
 					err := json.NewDecoder(r.Body).Decode(&req)
 					assert.NoError(t, err)
-					assert.True(t, req.Stream)
+					require.NotNil(t, req.Stream)
+					assert.True(t, *req.Stream)
 
 					// Set headers for JSONL
 					w.Header().Set("Content-Type", "application/x-ndjson")
@@ -404,6 +412,7 @@ func TestOllamaLLM_EmbeddingDualMode(t *testing.T) {
 				assert.Equal(t, tt.expectedPath, r.URL.Path)
 				assert.Equal(t, "POST", r.Method)
 
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 
 				if tt.useOpenAI {
@@ -422,13 +431,9 @@ func TestOllamaLLM_EmbeddingDualMode(t *testing.T) {
 						t.Fatalf("Failed to encode response: %v", err)
 					}
 				} else {
-					// Native embedding response
-					resp := &ollamaEmbeddingResponse{
-						Embedding: []float32{0.1, 0.2, 0.3, 0.4, 0.5},
-						Size:      5,
-						Usage: struct {
-							Tokens int `json:"tokens"`
-						}{Tokens: 10},
+					// Native embedding response (legacy /api/embeddings shape)
+					resp := &ollamaapi.EmbeddingResponse{
+						Embedding: []float64{0.1, 0.2, 0.3, 0.4, 0.5},
 					}
 					if err := json.NewEncoder(w).Encode(resp); err != nil {
 						t.Fatalf("Failed to encode response: %v", err)
@@ -452,11 +457,13 @@ func TestOllamaLLM_EmbeddingDualMode(t *testing.T) {
 			assert.NotNil(t, result)
 			assert.Len(t, result.Vector, 5)
 			assert.Equal(t, []float32{0.1, 0.2, 0.3, 0.4, 0.5}, result.Vector)
-			assert.Equal(t, 10, result.TokenCount)
 
 			if tt.useOpenAI {
+				// Token usage is reported on the OpenAI-compatible response.
+				assert.Equal(t, 10, result.TokenCount)
 				assert.Equal(t, "openai", result.Metadata["mode"])
 			} else {
+				// The legacy native /api/embeddings response has no token field.
 				assert.Equal(t, "native", result.Metadata["mode"])
 			}
 		})
@@ -580,24 +587,25 @@ func TestOllamaLLM_ErrorHandling(t *testing.T) {
 			expectedError: "API request failed with status 500",
 		},
 		{
-			name:          "Native server error",
-			serverStatus:  http.StatusInternalServerError,
-			useOpenAI:     false,
-			expectedError: "API request failed with status code 500",
+			name:           "Native server error",
+			serverStatus:   http.StatusInternalServerError,
+			serverResponse: `{"error":"boom"}`,
+			useOpenAI:      false,
+			expectedError:  "API request failed with status code 500",
 		},
 		{
 			name:           "OpenAI invalid JSON",
 			serverStatus:   http.StatusOK,
 			serverResponse: "{invalid json",
 			useOpenAI:      true,
-			expectedError:  "failed to unmarshal response",
+			expectedError:  "request failed",
 		},
 		{
 			name:           "Native invalid JSON",
 			serverStatus:   http.StatusOK,
 			serverResponse: "{invalid json",
 			useOpenAI:      false,
-			expectedError:  "failed to unmarshal response",
+			expectedError:  "request failed",
 		},
 	}
 
@@ -658,6 +666,7 @@ func TestOllamaLLM_JSON_Generation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 
 				if tt.useOpenAI {
@@ -671,8 +680,9 @@ func TestOllamaLLM_JSON_Generation(t *testing.T) {
 						t.Fatalf("Failed to encode response: %v", err)
 					}
 				} else {
-					resp := &ollamaResponse{
+					resp := &ollamaapi.GenerateResponse{
 						Response: tt.response,
+						Done:     true,
 					}
 					if err := json.NewEncoder(w).Encode(resp); err != nil {
 						t.Fatalf("Failed to encode response: %v", err)
@@ -707,6 +717,7 @@ func TestOllamaLLM_JSON_Generation(t *testing.T) {
 
 func TestOllamaLLM_MultimodalContent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		resp := &openai.ChatCompletionResponse{
 			Choices: []openai.ChatChoice{{
@@ -829,6 +840,7 @@ func TestOllamaLLM_Functions_OpenAICompatibleMode(t *testing.T) {
 				TotalTokens:      13,
 			},
 		}
+		w.Header().Set("Content-Type", "application/json")
 		require.NoError(t, json.NewEncoder(w).Encode(response))
 	}))
 	defer server.Close()
@@ -882,6 +894,7 @@ func TestOllamaLLM_BatchEmbeddings(t *testing.T) {
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 
 		resp := &openai.EmbeddingResponse{

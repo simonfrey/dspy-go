@@ -1,18 +1,22 @@
 package llms
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
+	stderrors "errors"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
+
+	ollamaapi "github.com/ollama/ollama/api"
+	openaisdk "github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/shared"
 
 	"github.com/XiaoConstantine/dspy-go/pkg/core"
 	"github.com/XiaoConstantine/dspy-go/pkg/errors"
-	"github.com/XiaoConstantine/dspy-go/pkg/llms/openai"
 	"github.com/XiaoConstantine/dspy-go/pkg/utils"
 )
 
@@ -24,17 +28,15 @@ type OllamaConfig struct {
 	Timeout      int    `yaml:"timeout" json:"timeout"`               // Default: 60
 }
 
-// OllamaLLM implements the core.LLM interface for Ollama-hosted models with dual-mode support.
+// OllamaLLM implements the core.LLM interface for Ollama-hosted models with
+// dual-mode support. In native mode it talks to /api/generate and friends via
+// the official github.com/ollama/ollama/api client. In OpenAI-compatible mode
+// it talks to /v1/* via the openai-go SDK pointed at the Ollama base URL.
 type OllamaLLM struct {
 	*core.BaseLLM
-	config    OllamaConfig
-	nativeAPI *ollamaNativeAPI // For backward compatibility
-}
-
-// ollamaNativeAPI handles Ollama's native API calls.
-type ollamaNativeAPI struct {
-	baseURL string
-	client  *http.Client
+	config       OllamaConfig
+	nativeClient *ollamaapi.Client // populated when UseOpenAIAPI is false
+	openaiClient openaisdk.Client  // populated when UseOpenAIAPI is true
 }
 
 // Option pattern for flexible configuration.
@@ -68,12 +70,11 @@ func WithTimeout(timeout int) OllamaOption {
 // NewOllamaLLM creates a new OllamaLLM instance with modern defaults.
 func NewOllamaLLM(modelID core.ModelID, options ...OllamaOption) (*OllamaLLM, error) {
 	config := OllamaConfig{
-		UseOpenAIAPI: true, // Default to modern OpenAI-compatible mode
+		UseOpenAIAPI: true,
 		BaseURL:      "http://localhost:11434",
 		Timeout:      60,
 	}
 
-	// Apply options to override defaults
 	for _, option := range options {
 		option(&config)
 	}
@@ -95,23 +96,19 @@ func NewOllamaLLMFromConfig(ctx context.Context, config core.ProviderConfig, mod
 
 // newOllamaLLMWithConfig creates OllamaLLM with the given configuration.
 func newOllamaLLMWithConfig(config OllamaConfig, modelID core.ModelID) (*OllamaLLM, error) {
-	// Extract model name from modelID (remove "ollama:" prefix if present)
 	modelName := strings.TrimPrefix(string(modelID), "ollama:")
 	if modelName == "" {
 		return nil, errors.New(errors.InvalidInput, "model name is required")
 	}
 
-	// Set up endpoint configuration based on mode
 	var endpointCfg *core.EndpointConfig
 	if config.UseOpenAIAPI {
-		// OpenAI-compatible mode
 		headers := map[string]string{
 			"Content-Type": "application/json",
 		}
 		if config.APIKey != "" {
 			headers["Authorization"] = "Bearer " + config.APIKey
 		}
-
 		endpointCfg = &core.EndpointConfig{
 			BaseURL:    config.BaseURL,
 			Path:       "/v1/chat/completions",
@@ -119,61 +116,80 @@ func newOllamaLLMWithConfig(config OllamaConfig, modelID core.ModelID) (*OllamaL
 			TimeoutSec: config.Timeout,
 		}
 	} else {
-		// Native API mode
 		endpointCfg = &core.EndpointConfig{
-			BaseURL: config.BaseURL,
-			Path:    "/api/generate",
-			Headers: map[string]string{
-				"Content-Type": "application/json",
-			},
+			BaseURL:    config.BaseURL,
+			Path:       "/api/generate",
+			Headers:    map[string]string{"Content-Type": "application/json"},
 			TimeoutSec: config.Timeout,
 		}
 	}
 
-	// Set capabilities based on model and mode
 	capabilities := []core.Capability{
 		core.CapabilityCompletion,
 		core.CapabilityChat,
 		core.CapabilityJSON,
 	}
-
-	// Most Ollama models support streaming
 	if supportsOllamaStreaming(modelName) {
 		capabilities = append(capabilities, core.CapabilityStreaming)
 	}
-
-	// Embedding support - only in OpenAI mode or for specific embedding models
 	if config.UseOpenAIAPI || supportsOllamaEmbedding(modelName) {
 		capabilities = append(capabilities, core.CapabilityEmbedding)
 	}
-
-	// Tool calling support is available via OpenAI-compatible API mode.
 	if config.UseOpenAIAPI {
 		capabilities = append(capabilities, core.CapabilityToolCalling)
 	}
 
-	// Create native API helper for backward compatibility
-	nativeAPI := &ollamaNativeAPI{
-		baseURL: config.BaseURL,
-		client:  &http.Client{},
+	httpClient := &http.Client{Timeout: time.Duration(config.Timeout) * time.Second}
+
+	llm := &OllamaLLM{
+		BaseLLM: core.NewBaseLLM("ollama", core.ModelID(modelName), capabilities, endpointCfg),
+		config:  config,
 	}
 
-	return &OllamaLLM{
-		BaseLLM:   core.NewBaseLLM("ollama", core.ModelID(modelName), capabilities, endpointCfg),
-		config:    config,
-		nativeAPI: nativeAPI,
-	}, nil
+	if config.UseOpenAIAPI {
+		llm.openaiClient = buildOllamaOpenAISDKClient(config, httpClient)
+	} else {
+		baseURL, err := url.Parse(config.BaseURL)
+		if err != nil {
+			return nil, errors.WithFields(
+				errors.Wrap(err, errors.InvalidInput, "failed to parse Ollama base URL"),
+				errors.Fields{"base_url": config.BaseURL})
+		}
+		llm.nativeClient = ollamaapi.NewClient(baseURL, httpClient)
+	}
+
+	return llm, nil
+}
+
+// buildOllamaOpenAISDKClient constructs an openai-go SDK client pointed at an
+// Ollama server's OpenAI-compatible /v1/ endpoint.
+func buildOllamaOpenAISDKClient(config OllamaConfig, httpClient *http.Client) openaisdk.Client {
+	base := strings.TrimRight(config.BaseURL, "/") + "/v1/"
+
+	apiKey := config.APIKey
+	if apiKey == "" {
+		// Many Ollama deployments don't require auth. Provide a placeholder
+		// so the SDK doesn't pick up an OPENAI_API_KEY from the environment.
+		apiKey = "ollama"
+	}
+
+	opts := []option.RequestOption{
+		option.WithBaseURL(base),
+		option.WithMaxRetries(0),
+		option.WithHTTPClient(httpClient),
+		option.WithAPIKey(apiKey),
+	}
+	return openaisdk.NewClient(opts...)
 }
 
 // parseOllamaConfig parses configuration supporting both legacy and modern formats.
 func parseOllamaConfig(config core.ProviderConfig) (OllamaConfig, error) {
 	result := OllamaConfig{
-		UseOpenAIAPI: true, // Default to modern mode
+		UseOpenAIAPI: true,
 		BaseURL:      "http://localhost:11434",
 		Timeout:      60,
 	}
 
-	// Parse base URL
 	if config.BaseURL != "" {
 		result.BaseURL = config.BaseURL
 	}
@@ -181,17 +197,14 @@ func parseOllamaConfig(config core.ProviderConfig) (OllamaConfig, error) {
 		result.BaseURL = config.Endpoint.BaseURL
 	}
 
-	// Parse API key
 	if config.APIKey != "" {
 		result.APIKey = config.APIKey
 	}
 
-	// Parse timeout
 	if config.Endpoint != nil && config.Endpoint.TimeoutSec > 0 {
 		result.Timeout = config.Endpoint.TimeoutSec
 	}
 
-	// Parse mode setting from params
 	if config.Params != nil {
 		if useOpenAI, ok := config.Params["use_openai_api"].(bool); ok {
 			result.UseOpenAIAPI = useOpenAI
@@ -212,174 +225,81 @@ func (o *OllamaLLM) Generate(ctx context.Context, prompt string, options ...core
 	return o.generateNative(ctx, prompt, options...)
 }
 
-// generateOpenAI uses OpenAI-compatible API.
+// generateOpenAI uses the openai-go SDK pointed at the Ollama OpenAI-compatible endpoint.
 func (o *OllamaLLM) generateOpenAI(ctx context.Context, prompt string, options ...core.GenerateOption) (*core.LLMResponse, error) {
 	opts := core.NewGenerateOptions()
 	for _, opt := range options {
 		opt(opts)
 	}
 
-	// Create OpenAI-compatible request
-	req := &openai.ChatCompletionRequest{
-		Model:    string(o.ModelID()),
-		Messages: []openai.ChatCompletionMessage{{Role: "user", Content: prompt}},
-		Stream:   false,
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaisdk.UserMessage(prompt),
+		},
 	}
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
 
-	// Apply generate options using shared helper
-	req.ApplyOptions(coreOptsToOpenAI(opts))
-
-	// Make HTTP request
-	jsonData, err := json.Marshal(req)
+	response, err := o.openaiClient.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to marshal request"),
-			errors.Fields{"model": o.ModelID()})
+		return nil, mapOllamaOpenAIError(err, o.ModelID())
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		o.GetEndpointConfig().BaseURL+"/v1/chat/completions", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to create request"),
-			errors.Fields{"model": o.ModelID()})
-	}
-
-	// Set headers
-	for key, value := range o.GetEndpointConfig().Headers {
-		httpReq.Header.Set(key, value)
-	}
-
-	resp, err := o.GetHTTPClient().Do(httpReq)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.LLMGenerationFailed, "failed to send request"),
-			errors.Fields{"model": o.ModelID()})
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.LLMGenerationFailed, "failed to read response"),
-			errors.Fields{"model": o.ModelID()})
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("API request failed with status %d", resp.StatusCode)),
-			errors.Fields{
-				"model":         o.ModelID(),
-				"status_code":   resp.StatusCode,
-				"response_body": string(body),
-			})
-	}
-
-	var openaiResp openai.ChatCompletionResponse
-	if err := json.Unmarshal(body, &openaiResp); err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidResponse, "failed to unmarshal response"),
-			errors.Fields{
-				"model": o.ModelID(),
-				"body":  string(body[:min(len(body), 100)]),
-			})
-	}
-
-	// Transform to LLMResponse
-	if len(openaiResp.Choices) == 0 {
+	if len(response.Choices) == 0 {
 		return nil, errors.WithFields(
 			errors.New(errors.InvalidResponse, "no choices in response"),
 			errors.Fields{"model": o.ModelID()})
 	}
 
 	return &core.LLMResponse{
-		Content: openaiResp.Choices[0].Message.Content,
+		Content: response.Choices[0].Message.Content,
 		Usage: &core.TokenInfo{
-			PromptTokens:     openaiResp.Usage.PromptTokens,
-			CompletionTokens: openaiResp.Usage.CompletionTokens,
-			TotalTokens:      openaiResp.Usage.TotalTokens,
+			PromptTokens:     int(response.Usage.PromptTokens),
+			CompletionTokens: int(response.Usage.CompletionTokens),
+			TotalTokens:      int(response.Usage.TotalTokens),
 		},
 		Metadata: map[string]interface{}{
-			"model": openaiResp.Model,
+			"model": response.Model,
 			"mode":  "openai",
 		},
 	}, nil
 }
 
-// generateNative uses Ollama's native API for backward compatibility.
+// generateNative uses the official github.com/ollama/ollama/api client.
 func (o *OllamaLLM) generateNative(ctx context.Context, prompt string, options ...core.GenerateOption) (*core.LLMResponse, error) {
 	opts := core.NewGenerateOptions()
 	for _, opt := range options {
 		opt(opts)
 	}
 
-	reqBody := ollamaRequest{
-		Model:       o.ModelID(),
-		Prompt:      prompt,
-		Stream:      false,
-		MaxTokens:   opts.MaxTokens,
-		Temperature: opts.Temperature,
+	streamFalse := false
+	req := &ollamaapi.GenerateRequest{
+		Model:   string(o.ModelID()),
+		Prompt:  prompt,
+		Stream:  &streamFalse,
+		Options: buildOllamaNativeOptions(opts),
 	}
 
-	jsonData, err := json.Marshal(reqBody)
+	var lastResp ollamaapi.GenerateResponse
+	var received bool
+	err := o.nativeClient.Generate(ctx, req, func(r ollamaapi.GenerateResponse) error {
+		lastResp = r
+		received = true
+		return nil
+	})
 	if err != nil {
+		return nil, mapOllamaNativeError(err, o.ModelID())
+	}
+	if !received {
 		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to marshal request body"),
+			errors.New(errors.LLMGenerationFailed, "ollama native API returned no response"),
 			errors.Fields{"model": o.ModelID()})
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		o.GetEndpointConfig().BaseURL+"/api/generate", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to create request"),
-			errors.Fields{"model": o.ModelID()})
-	}
-
-	for key, value := range o.GetEndpointConfig().Headers {
-		req.Header.Set(key, value)
-	}
-
-	resp, err := o.GetHTTPClient().Do(req)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.LLMGenerationFailed, "failed to send request"),
-			errors.Fields{"model": o.ModelID()})
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.LLMGenerationFailed, "failed to read response body"),
-			errors.Fields{"model": o.ModelID()})
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("API request failed with status code %d", resp.StatusCode)),
-			errors.Fields{
-				"model":         o.ModelID(),
-				"status_code":   resp.StatusCode,
-				"response_body": string(body),
-			})
-	}
-
-	var ollamaResp ollamaResponse
-	err = json.Unmarshal(body, &ollamaResp)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidResponse, "failed to unmarshal response"),
-			errors.Fields{
-				"model": o.ModelID(),
-				"body":  string(body[:min(len(body), 50)]),
-			})
 	}
 
 	return &core.LLMResponse{
-		Content: ollamaResp.Response,
+		Content: lastResp.Response,
 		Metadata: map[string]interface{}{
-			"model": ollamaResp.Model,
+			"model": lastResp.Model,
 			"mode":  "native",
 		},
 	}, nil
@@ -393,150 +313,93 @@ func (o *OllamaLLM) StreamGenerate(ctx context.Context, prompt string, options .
 	return o.streamGenerateNative(ctx, prompt, options...)
 }
 
-// streamGenerateOpenAI uses OpenAI-compatible streaming.
 func (o *OllamaLLM) streamGenerateOpenAI(ctx context.Context, prompt string, options ...core.GenerateOption) (*core.StreamResponse, error) {
 	opts := core.NewGenerateOptions()
 	for _, opt := range options {
 		opt(opts)
 	}
 
-	req := &openai.ChatCompletionRequest{
-		Model:    string(o.ModelID()),
-		Messages: []openai.ChatCompletionMessage{{Role: "user", Content: prompt}},
-		Stream:   true,
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaisdk.UserMessage(prompt),
+		},
 	}
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
 
-	req.ApplyOptions(coreOptsToOpenAI(opts))
-
-	chunkChan := make(chan core.StreamChunk, 100)
+	chunkChan := make(chan core.StreamChunk)
 	streamCtx, cancelStream := context.WithCancel(ctx)
-
-	response := &core.StreamResponse{
-		ChunkChannel: chunkChan,
-		Cancel:       cancelStream,
-	}
 
 	go func() {
 		defer close(chunkChan)
 		defer cancelStream()
 
-		// Make streaming request
-		jsonData, err := json.Marshal(req)
-		if err != nil {
-			chunkChan <- core.StreamChunk{Error: err}
-			return
-		}
+		stream := o.openaiClient.Chat.Completions.NewStreaming(streamCtx, params)
+		defer func() {
+			_ = stream.Close()
+		}()
 
-		httpReq, err := http.NewRequestWithContext(streamCtx, "POST",
-			o.GetEndpointConfig().BaseURL+"/v1/chat/completions", bytes.NewBuffer(jsonData))
-		if err != nil {
-			chunkChan <- core.StreamChunk{Error: err}
-			return
-		}
-
-		for key, value := range o.GetEndpointConfig().Headers {
-			httpReq.Header.Set(key, value)
-		}
-
-		resp, err := o.GetHTTPClient().Do(httpReq)
-		if err != nil {
-			chunkChan <- core.StreamChunk{Error: err}
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			chunkChan <- core.StreamChunk{Error: fmt.Errorf("HTTP %d", resp.StatusCode)}
-			return
-		}
-
-		// Parse SSE format
-		o.parseOpenAIStreamResponse(resp.Body, chunkChan)
+		pumpOpenAIChatCompletionStream(streamCtx, stream, chunkChan)
 	}()
 
-	return response, nil
+	return &core.StreamResponse{
+		ChunkChannel: chunkChan,
+		Cancel:       cancelStream,
+	}, nil
 }
 
-// streamGenerateNative uses Ollama's native streaming.
 func (o *OllamaLLM) streamGenerateNative(ctx context.Context, prompt string, options ...core.GenerateOption) (*core.StreamResponse, error) {
 	opts := core.NewGenerateOptions()
 	for _, opt := range options {
 		opt(opts)
 	}
 
-	reqBody := ollamaRequest{
-		Model:       o.ModelID(),
-		Prompt:      prompt,
-		Stream:      true,
-		MaxTokens:   opts.MaxTokens,
-		Temperature: opts.Temperature,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.InvalidInput, "failed to marshal request")
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		o.GetEndpointConfig().BaseURL+"/api/generate", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, errors.Wrap(err, errors.InvalidInput, "failed to create request")
-	}
-
-	for key, value := range o.GetEndpointConfig().Headers {
-		req.Header.Set(key, value)
+	streamTrue := true
+	req := &ollamaapi.GenerateRequest{
+		Model:   string(o.ModelID()),
+		Prompt:  prompt,
+		Stream:  &streamTrue,
+		Options: buildOllamaNativeOptions(opts),
 	}
 
 	chunkChan := make(chan core.StreamChunk)
 	streamCtx, cancelStream := context.WithCancel(ctx)
 
-	response := &core.StreamResponse{
-		ChunkChannel: chunkChan,
-		Cancel:       cancelStream,
-	}
-
 	go func() {
 		defer close(chunkChan)
 
-		resp, err := o.GetHTTPClient().Do(req)
-		if err != nil {
-			chunkChan <- core.StreamChunk{Error: err}
-			return
-		}
-		defer resp.Body.Close()
-
-		// Ollama returns JSONL stream
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
+		err := o.nativeClient.Generate(streamCtx, req, func(r ollamaapi.GenerateResponse) error {
+			if err := streamCtx.Err(); err != nil {
+				return err
+			}
+			if r.Response != "" {
+				select {
+				case chunkChan <- core.StreamChunk{Content: r.Response}:
+				case <-streamCtx.Done():
+					return streamCtx.Err()
+				}
+			}
+			if r.Done {
+				select {
+				case chunkChan <- core.StreamChunk{Done: true}:
+				case <-streamCtx.Done():
+					return streamCtx.Err()
+				}
+			}
+			return nil
+		})
+		if err != nil && !stderrors.Is(err, context.Canceled) {
 			select {
+			case chunkChan <- core.StreamChunk{Error: mapOllamaNativeError(err, o.ModelID())}:
 			case <-streamCtx.Done():
-				return
-			default:
-				line := scanner.Text()
-				if line == "" {
-					continue
-				}
-
-				var response struct {
-					Response string `json:"response"`
-					Done     bool   `json:"done"`
-				}
-
-				if err := json.Unmarshal([]byte(line), &response); err != nil {
-					continue
-				}
-
-				chunkChan <- core.StreamChunk{Content: response.Response}
-
-				if response.Done {
-					chunkChan <- core.StreamChunk{Done: true}
-					return
-				}
 			}
 		}
 	}()
 
-	return response, nil
+	return &core.StreamResponse{
+		ChunkChannel: chunkChan,
+		Cancel:       cancelStream,
+	}, nil
 }
 
 // CreateEmbedding implements embedding generation with OpenAI-compatible mode support.
@@ -557,128 +420,78 @@ func (o *OllamaLLM) CreateEmbedding(ctx context.Context, input string, options .
 	return o.createEmbeddingNative(ctx, input, options...)
 }
 
-// createEmbeddingOpenAI uses OpenAI-compatible embeddings API.
 func (o *OllamaLLM) createEmbeddingOpenAI(ctx context.Context, input string, options ...core.EmbeddingOption) (*core.EmbeddingResult, error) {
 	opts := core.NewEmbeddingOptions()
 	for _, opt := range options {
 		opt(opts)
 	}
 
-	req := &openai.EmbeddingRequest{
-		Input: input,
-		Model: string(o.ModelID()),
+	model := string(o.ModelID())
+	if opts.Model != "" {
+		model = opts.Model
 	}
 
-	jsonData, err := json.Marshal(req)
+	params := openaisdk.EmbeddingNewParams{
+		Input: openaisdk.EmbeddingNewParamsInputUnion{
+			OfString: param.NewOpt(input),
+		},
+		Model:          openaisdk.EmbeddingModel(model),
+		EncodingFormat: openaisdk.EmbeddingNewParamsEncodingFormatFloat,
+	}
+
+	response, err := o.openaiClient.Embeddings.New(ctx, params)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal embedding request: %w", err)
+		return nil, mapOllamaOpenAIError(err, o.ModelID())
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		o.GetEndpointConfig().BaseURL+"/v1/embeddings", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	if len(response.Data) == 0 {
+		return nil, errors.WithFields(
+			errors.New(errors.InvalidResponse, "no embeddings in response"),
+			errors.Fields{"model": o.ModelID()})
 	}
 
-	for key, value := range o.GetEndpointConfig().Headers {
-		httpReq.Header.Set(key, value)
-	}
-
-	resp, err := o.GetHTTPClient().Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var embeddingResp openai.EmbeddingResponse
-	if err := json.Unmarshal(body, &embeddingResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	if len(embeddingResp.Data) == 0 {
-		return nil, fmt.Errorf("no embeddings in response")
-	}
-
-	// Convert float64 to float32
-	embedding32 := make([]float32, len(embeddingResp.Data[0].Embedding))
-	for i, v := range embeddingResp.Data[0].Embedding {
-		embedding32[i] = float32(v)
+	embedding := make([]float32, len(response.Data[0].Embedding))
+	for i, v := range response.Data[0].Embedding {
+		embedding[i] = float32(v)
 	}
 
 	return &core.EmbeddingResult{
-		Vector:     embedding32,
-		TokenCount: embeddingResp.Usage.TotalTokens,
+		Vector:     embedding,
+		TokenCount: int(response.Usage.TotalTokens),
 		Metadata: map[string]interface{}{
-			"model": embeddingResp.Model,
+			"model": response.Model,
 			"mode":  "openai",
 		},
 	}, nil
 }
 
-// createEmbeddingNative uses Ollama's native embedding API.
 func (o *OllamaLLM) createEmbeddingNative(ctx context.Context, input string, options ...core.EmbeddingOption) (*core.EmbeddingResult, error) {
 	opts := core.NewEmbeddingOptions()
 	for _, opt := range options {
 		opt(opts)
 	}
 
-	reqBody := ollamaEmbeddingRequest{
-		Model:   o.ModelID(),
+	req := &ollamaapi.EmbeddingRequest{
+		Model:   string(o.ModelID()),
 		Prompt:  input,
 		Options: opts.Params,
 	}
 
-	jsonData, err := json.Marshal(reqBody)
+	resp, err := o.nativeClient.Embeddings(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal embedding request: %w", err)
+		return nil, mapOllamaNativeError(err, o.ModelID())
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		fmt.Sprintf("%s/api/embeddings", o.GetEndpointConfig().BaseURL), bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	for key, value := range o.GetEndpointConfig().Headers {
-		req.Header.Set(key, value)
-	}
-
-	resp, err := o.GetHTTPClient().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status code %d: %s", resp.StatusCode, string(body))
-	}
-
-	var ollamaResp ollamaEmbeddingResponse
-	if err := json.Unmarshal(body, &ollamaResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	embedding := make([]float32, len(resp.Embedding))
+	for i, v := range resp.Embedding {
+		embedding[i] = float32(v)
 	}
 
 	return &core.EmbeddingResult{
-		Vector:     ollamaResp.Embedding,
-		TokenCount: ollamaResp.Usage.Tokens,
+		Vector: embedding,
 		Metadata: map[string]interface{}{
-			"model":          o.ModelID(),
-			"embedding_size": ollamaResp.Size,
-			"mode":           "native",
+			"model": o.ModelID(),
+			"mode":  "native",
 		},
 	}, nil
 }
@@ -693,6 +506,7 @@ func (o *OllamaLLM) GenerateWithJSON(ctx context.Context, prompt string, options
 	return utils.ParseJSONResponse(response.Content)
 }
 
+// GenerateWithFunctions performs function calling via the OpenAI-compatible mode.
 func (o *OllamaLLM) GenerateWithFunctions(ctx context.Context, prompt string, functions []map[string]interface{}, options ...core.GenerateOption) (map[string]interface{}, error) {
 	if !o.config.UseOpenAIAPI {
 		return nil, errors.WithFields(
@@ -713,138 +527,39 @@ func (o *OllamaLLM) GenerateWithFunctions(ctx context.Context, prompt string, fu
 		opt(opts)
 	}
 
-	tools, err := convertOpenAIFunctionSchemas(functions)
+	tools, err := convertOpenAIFunctionSchemasToSDK(functions)
 	if err != nil {
 		return nil, err
 	}
 
-	req := &openai.ChatCompletionRequest{
-		Model: string(o.ModelID()),
-		Messages: []openai.ChatCompletionMessage{
-			{Role: "user", Content: prompt},
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaisdk.UserMessage(prompt),
 		},
-		Tools:      tools,
-		ToolChoice: "auto",
+		Tools: tools,
+		ToolChoice: openaisdk.ChatCompletionToolChoiceOptionUnionParam{
+			OfAuto: param.NewOpt("auto"),
+		},
 	}
-	req.ApplyOptions(coreOptsToOpenAI(opts))
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
 
-	jsonData, err := json.Marshal(req)
+	response, err := o.openaiClient.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to marshal request"),
-			errors.Fields{"model": o.ModelID()})
+		return nil, mapOllamaOpenAIError(err, o.ModelID())
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		o.GetEndpointConfig().BaseURL+"/v1/chat/completions", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to create request"),
-			errors.Fields{"model": o.ModelID()})
-	}
-
-	for key, value := range o.GetEndpointConfig().Headers {
-		httpReq.Header.Set(key, value)
-	}
-
-	resp, err := o.GetHTTPClient().Do(httpReq)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.LLMGenerationFailed, "failed to send request"),
-			errors.Fields{"model": o.ModelID()})
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.LLMGenerationFailed, "failed to read response"),
-			errors.Fields{"model": o.ModelID()})
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("API request failed with status %d", resp.StatusCode)),
-			errors.Fields{
-				"model":         o.ModelID(),
-				"status_code":   resp.StatusCode,
-				"response_body": string(body),
-			})
-	}
-
-	var openAIResp openai.ChatCompletionResponse
-	if err := json.Unmarshal(body, &openAIResp); err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidResponse, "failed to unmarshal response"),
-			errors.Fields{
-				"model": o.ModelID(),
-				"body":  string(body[:min(len(body), 100)]),
-			})
-	}
-
-	if len(openAIResp.Choices) == 0 {
+	if len(response.Choices) == 0 {
 		return nil, errors.WithFields(
 			errors.New(errors.InvalidResponse, "no choices in response"),
 			errors.Fields{"model": o.ModelID()})
 	}
 
-	choice := openAIResp.Choices[0]
-	result := map[string]interface{}{}
-
-	if content := strings.TrimSpace(choice.Message.Content); content != "" {
-		result["content"] = content
-	}
-
-	if len(choice.Message.ToolCalls) > 0 {
-		call := choice.Message.ToolCalls[0]
-		arguments, err := parseOpenAIFunctionArguments(call.Function.Arguments)
-		if err != nil {
-			return nil, errors.WithFields(
-				errors.Wrap(err, errors.InvalidResponse, "failed to parse tool call arguments"),
-				errors.Fields{
-					"model":     o.ModelID(),
-					"tool_name": call.Function.Name,
-				},
-			)
-		}
-		result["function_call"] = map[string]interface{}{
-			"name":      call.Function.Name,
-			"arguments": arguments,
-		}
-	} else if choice.Message.FunctionCall != nil && choice.Message.FunctionCall.Name != "" {
-		arguments, err := parseOpenAIFunctionArguments(choice.Message.FunctionCall.Arguments)
-		if err != nil {
-			return nil, errors.WithFields(
-				errors.Wrap(err, errors.InvalidResponse, "failed to parse legacy function call arguments"),
-				errors.Fields{
-					"model":     o.ModelID(),
-					"tool_name": choice.Message.FunctionCall.Name,
-				},
-			)
-		}
-		result["function_call"] = map[string]interface{}{
-			"name":      choice.Message.FunctionCall.Name,
-			"arguments": arguments,
-		}
-	}
-
-	if len(result) == 0 {
-		result["content"] = "No content or function call received from model"
-	}
-
-	result["_usage"] = &core.TokenInfo{
-		PromptTokens:     openAIResp.Usage.PromptTokens,
-		CompletionTokens: openAIResp.Usage.CompletionTokens,
-		TotalTokens:      openAIResp.Usage.TotalTokens,
-	}
-
-	return result, nil
+	return buildOpenAIToolResultFromSDK(response.Choices[0], response.Usage, "ollama")
 }
 
 // GenerateWithContent implements multimodal content generation.
 func (o *OllamaLLM) GenerateWithContent(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.LLMResponse, error) {
-	// For now, extract text content and fall back to text generation
-	// Future versions could support vision models in Ollama
 	var textContent string
 	for _, block := range content {
 		if block.Type == core.FieldTypeText {
@@ -866,7 +581,6 @@ func (o *OllamaLLM) GenerateWithContent(ctx context.Context, content []core.Cont
 
 // StreamGenerateWithContent implements multimodal streaming content generation.
 func (o *OllamaLLM) StreamGenerateWithContent(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.StreamResponse, error) {
-	// For now, extract text content and fall back to text streaming
 	var textContent string
 	for _, block := range content {
 		if block.Type == core.FieldTypeText {
@@ -889,76 +603,48 @@ func (o *OllamaLLM) StreamGenerateWithContent(ctx context.Context, content []cor
 // CreateEmbeddings generates embeddings for multiple inputs.
 func (o *OllamaLLM) CreateEmbeddings(ctx context.Context, inputs []string, options ...core.EmbeddingOption) (*core.BatchEmbeddingResult, error) {
 	if o.config.UseOpenAIAPI {
-		// Use batching for OpenAI-compatible API
 		opts := core.NewEmbeddingOptions()
 		for _, opt := range options {
 			opt(opts)
 		}
 
-		req := &openai.EmbeddingRequest{
-			Input: inputs,
-			Model: string(o.ModelID()),
+		model := string(o.ModelID())
+		if opts.Model != "" {
+			model = opts.Model
 		}
 
-		jsonData, err := json.Marshal(req)
+		params := openaisdk.EmbeddingNewParams{
+			Input: openaisdk.EmbeddingNewParamsInputUnion{
+				OfArrayOfStrings: inputs,
+			},
+			Model:          openaisdk.EmbeddingModel(model),
+			EncodingFormat: openaisdk.EmbeddingNewParamsEncodingFormatFloat,
+		}
+
+		response, err := o.openaiClient.Embeddings.New(ctx, params)
 		if err != nil {
-			return nil, errors.Wrap(err, errors.InvalidInput, "failed to marshal embedding request")
+			return nil, mapOllamaOpenAIError(err, o.ModelID())
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx,
-			"POST",
-			o.GetEndpointConfig().BaseURL+"/v1/embeddings",
-			bytes.NewBuffer(jsonData),
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, errors.Unknown, "failed to create embedding request")
-		}
-
-		for key, value := range o.GetEndpointConfig().Headers {
-			httpReq.Header.Set(key, value)
-		}
-
-		resp, err := o.GetHTTPClient().Do(httpReq)
-		if err != nil {
-			return nil, errors.Wrap(err, errors.LLMGenerationFailed, "embedding request failed")
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, errors.Wrap(err, errors.LLMGenerationFailed, "failed to read embedding response")
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, errors.WithFields(
-				errors.New(errors.LLMGenerationFailed, "API request failed"),
-				errors.Fields{"status": resp.StatusCode, "body": string(body)})
-		}
-
-		var embeddingResp openai.EmbeddingResponse
-		if err := json.Unmarshal(body, &embeddingResp); err != nil {
-			return nil, errors.Wrap(err, errors.InvalidResponse, "failed to parse embedding response")
-		}
-
-		if len(embeddingResp.Data) == 0 {
+		if len(response.Data) == 0 {
 			return nil, errors.New(errors.InvalidResponse, "no embeddings in response")
 		}
 
-		results := make([]core.EmbeddingResult, len(embeddingResp.Data))
-		for i, data := range embeddingResp.Data {
-			embedding32 := make([]float32, len(data.Embedding))
+		results := make([]core.EmbeddingResult, len(response.Data))
+		for i, data := range response.Data {
+			embedding := make([]float32, len(data.Embedding))
 			for j, v := range data.Embedding {
-				embedding32[j] = float32(v)
+				embedding[j] = float32(v)
 			}
-			tokenCount := 0
+			perInputTokens := 0
 			if len(inputs) > 0 {
-				tokenCount = embeddingResp.Usage.TotalTokens / len(inputs) // Approximate
+				perInputTokens = int(response.Usage.TotalTokens) / len(inputs)
 			}
 			results[i] = core.EmbeddingResult{
-				Vector:     embedding32,
-				TokenCount: tokenCount,
+				Vector:     embedding,
+				TokenCount: perInputTokens,
 				Metadata: map[string]interface{}{
-					"model":       embeddingResp.Model,
+					"model":       response.Model,
 					"mode":        "openai",
 					"batch_index": i,
 				},
@@ -967,11 +653,12 @@ func (o *OllamaLLM) CreateEmbeddings(ctx context.Context, inputs []string, optio
 
 		return &core.BatchEmbeddingResult{
 			Embeddings: results,
-			ErrorIndex: -1, // No error occurred
+			ErrorIndex: -1,
 		}, nil
 	}
 
-	// Fallback to looping for native mode
+	// Native mode: loop over inputs since the legacy /api/embeddings endpoint
+	// is single-input. Behavior matches the prior implementation.
 	var allResults []core.EmbeddingResult
 	var firstError error
 	var errorIndex = -1
@@ -1001,38 +688,83 @@ func (o *OllamaLLM) CreateEmbeddings(ctx context.Context, inputs []string, optio
 	}, firstError
 }
 
-// Helper functions
+// buildOllamaNativeOptions translates core.GenerateOptions into the
+// model-options map shape Ollama's /api/generate expects (e.g. "num_predict",
+// "temperature").
+func buildOllamaNativeOptions(opts *core.GenerateOptions) map[string]any {
+	if opts == nil {
+		return nil
+	}
+	out := map[string]any{}
+	if opts.MaxTokens > 0 {
+		out["num_predict"] = opts.MaxTokens
+	}
+	if opts.Temperature >= 0 {
+		out["temperature"] = opts.Temperature
+	}
+	if opts.TopP > 0 {
+		out["top_p"] = opts.TopP
+	}
+	if len(opts.Stop) > 0 {
+		out["stop"] = opts.Stop
+	}
+	if opts.PresencePenalty != 0 {
+		out["presence_penalty"] = opts.PresencePenalty
+	}
+	if opts.FrequencyPenalty != 0 {
+		out["frequency_penalty"] = opts.FrequencyPenalty
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
 
-// parseOpenAIStreamResponse parses OpenAI SSE format.
-func (o *OllamaLLM) parseOpenAIStreamResponse(body io.Reader, chunkChan chan<- core.StreamChunk) {
-	scanner := bufio.NewScanner(body)
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-
-			if data == "[DONE]" {
-				chunkChan <- core.StreamChunk{Done: true}
-				return
-			}
-
-			var streamResp openai.ChatCompletionStreamResponse
-			if err := json.Unmarshal([]byte(data), &streamResp); err != nil {
-				continue
-			}
-
-			if len(streamResp.Choices) > 0 && streamResp.Choices[0].Delta.Content != "" {
-				chunkChan <- core.StreamChunk{
-					Content: streamResp.Choices[0].Delta.Content,
-				}
-			}
+// mapOllamaOpenAIError shapes an openai-go SDK error into a dspy-go errors.Error
+// and ensures the message contains the HTTP status code (the historical contract
+// the Ollama tests assert against).
+func mapOllamaOpenAIError(err error, model string) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *openaisdk.Error
+	if stderrors.As(err, &apiErr) {
+		msg := strings.TrimSpace(apiErr.Message)
+		if msg == "" {
+			msg = fmt.Sprintf("API request failed with status %d", apiErr.StatusCode)
 		}
+		return errors.WithFields(
+			errors.New(errors.LLMGenerationFailed, msg),
+			errors.Fields{
+				"model":       model,
+				"status_code": apiErr.StatusCode,
+				"type":        apiErr.Type,
+				"code":        apiErr.Code,
+			})
 	}
+	return errors.WithFields(
+		errors.Wrap(err, errors.LLMGenerationFailed, "request failed"),
+		errors.Fields{"model": model})
+}
 
-	if err := scanner.Err(); err != nil {
-		chunkChan <- core.StreamChunk{Error: err}
+// mapOllamaNativeError shapes an ollama-api SDK error into a dspy-go errors.Error.
+func mapOllamaNativeError(err error, model string) error {
+	if err == nil {
+		return nil
 	}
+	var statusErr ollamaapi.StatusError
+	if stderrors.As(err, &statusErr) {
+		msg := fmt.Sprintf("API request failed with status code %d", statusErr.StatusCode)
+		if trimmed := strings.TrimSpace(statusErr.ErrorMessage); trimmed != "" {
+			msg = fmt.Sprintf("%s: %s", msg, trimmed)
+		}
+		return errors.WithFields(
+			errors.New(errors.LLMGenerationFailed, msg),
+			errors.Fields{"model": model, "status_code": statusErr.StatusCode})
+	}
+	return errors.WithFields(
+		errors.Wrap(err, errors.LLMGenerationFailed, "request failed"),
+		errors.Fields{"model": model})
 }
 
 // supportsOllamaStreaming checks if the model supports streaming.
@@ -1045,7 +777,6 @@ func supportsOllamaStreaming(_ string) bool {
 
 // supportsOllamaEmbedding checks if the model supports embedding.
 func supportsOllamaEmbedding(modelName string) bool {
-	// Common embedding models in Ollama
 	embeddingModels := []string{
 		"nomic-embed-text",
 		"mxbai-embed-large",
@@ -1060,7 +791,6 @@ func supportsOllamaEmbedding(modelName string) bool {
 		}
 	}
 
-	// Check for common embedding model patterns
 	if strings.Contains(modelLower, "embed") {
 		return true
 	}
@@ -1071,60 +801,4 @@ func supportsOllamaEmbedding(modelName string) bool {
 // OllamaProviderFactory creates OllamaLLM instances.
 func OllamaProviderFactory(ctx context.Context, config core.ProviderConfig, modelID core.ModelID) (core.LLM, error) {
 	return NewOllamaLLMFromConfig(ctx, config, modelID)
-}
-
-// min returns the smaller of two integers.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// Legacy types for backward compatibility (native API mode)
-
-type ollamaRequest struct {
-	Model       string  `json:"model"`
-	Prompt      string  `json:"prompt"`
-	Stream      bool    `json:"stream"`
-	MaxTokens   int     `json:"max_tokens,omitempty"`
-	Temperature float64 `json:"temperature,omitempty"`
-}
-
-type ollamaResponse struct {
-	Model     string `json:"model"`
-	CreatedAt string `json:"created_at"`
-	Response  string `json:"response"`
-}
-
-type ollamaEmbeddingRequest struct {
-	Model   string                 `json:"model"`
-	Prompt  string                 `json:"prompt"`
-	Options map[string]interface{} `json:"options"`
-}
-
-type ollamaEmbeddingResponse struct {
-	Embedding []float32 `json:"embedding"`
-	Size      int       `json:"size"`
-	Usage     struct {
-		Tokens int `json:"tokens"`
-	} `json:"usage"`
-}
-
-// ollamaBatchEmbeddingRequest is reserved for future native batch embedding support.
-// Currently unused but kept for potential future Ollama batch API support.
-//
-//nolint:unused // Reserved for future use
-type ollamaBatchEmbeddingRequest struct {
-	Model   string                 `json:"model"`
-	Prompts []string               `json:"prompts"`
-	Options map[string]interface{} `json:"options"`
-}
-
-// ollamaBatchEmbeddingResponse is reserved for future native batch embedding support.
-// Currently unused but kept for potential future Ollama batch API support.
-//
-//nolint:unused // Reserved for future use
-type ollamaBatchEmbeddingResponse struct {
-	Embeddings []ollamaEmbeddingResponse `json:"embeddings"`
 }
