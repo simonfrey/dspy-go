@@ -745,14 +745,15 @@ func TestOllamaLLM_MultimodalContent(t *testing.T) {
 		assert.Equal(t, "Processed text content", result.Content)
 	})
 
-	t.Run("Non-text content should fail", func(t *testing.T) {
+	t.Run("Image content is forwarded to model", func(t *testing.T) {
 		content := []core.ContentBlock{
+			core.NewTextBlock("describe this"),
 			core.NewImageBlock([]byte("fake image data"), "image/jpeg"),
 		}
 
-		_, err := llm.GenerateWithContent(context.Background(), content)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "multimodal content not yet supported")
+		result, err := llm.GenerateWithContent(context.Background(), content)
+		assert.NoError(t, err)
+		assert.Equal(t, "Processed text content", result.Content)
 	})
 
 	t.Run("Streaming with content", func(t *testing.T) {

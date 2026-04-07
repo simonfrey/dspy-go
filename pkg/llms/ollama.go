@@ -558,46 +558,269 @@ func (o *OllamaLLM) GenerateWithFunctions(ctx context.Context, prompt string, fu
 	return buildOpenAIToolResultFromSDK(response.Choices[0], response.Usage, "ollama")
 }
 
-// GenerateWithContent implements multimodal content generation.
+// GenerateWithContent implements multimodal content generation. Image inputs
+// are forwarded to the model as part of a single user turn; in OpenAI mode the
+// SDK serializes them as image_url data URLs, and in native mode they are
+// passed through ollamaapi.ChatRequest as base-64 image bytes. Inputs are not
+// stored or used for training, identical to text prompts.
 func (o *OllamaLLM) GenerateWithContent(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.LLMResponse, error) {
-	var textContent string
-	for _, block := range content {
-		if block.Type == core.FieldTypeText {
-			textContent += block.Text + "\n"
-		}
+	if len(content) == 0 {
+		return nil, errors.New(errors.InvalidInput, "no content provided")
 	}
-
-	if textContent == "" {
-		return nil, errors.WithFields(
-			errors.New(errors.UnsupportedOperation, "multimodal content not yet supported for Ollama"),
-			errors.Fields{
-				"provider": "ollama",
-				"model":    o.ModelID(),
-			})
+	if !ollamaContentHasNonText(content) {
+		return o.Generate(ctx, ollamaJoinTextBlocks(content), options...)
 	}
-
-	return o.Generate(ctx, strings.TrimSpace(textContent), options...)
+	if o.config.UseOpenAIAPI {
+		return o.generateWithContentOpenAI(ctx, content, options...)
+	}
+	return o.generateWithContentNative(ctx, content, options...)
 }
 
 // StreamGenerateWithContent implements multimodal streaming content generation.
 func (o *OllamaLLM) StreamGenerateWithContent(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.StreamResponse, error) {
-	var textContent string
+	if len(content) == 0 {
+		return nil, errors.New(errors.InvalidInput, "no content provided")
+	}
+	if !ollamaContentHasNonText(content) {
+		return o.StreamGenerate(ctx, ollamaJoinTextBlocks(content), options...)
+	}
+	if o.config.UseOpenAIAPI {
+		return o.streamGenerateWithContentOpenAI(ctx, content, options...)
+	}
+	return o.streamGenerateWithContentNative(ctx, content, options...)
+}
+
+func (o *OllamaLLM) generateWithContentOpenAI(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.LLMResponse, error) {
+	opts := core.NewGenerateOptions()
+	for _, opt := range options {
+		opt(opts)
+	}
+
+	parts, err := convertContentBlocksToOpenAIParts(content)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) == 0 {
+		return nil, errors.New(errors.InvalidInput, "no content provided")
+	}
+
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaiUserMessageFromParts(parts),
+		},
+	}
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
+
+	response, err := o.openaiClient.Chat.Completions.New(ctx, params)
+	if err != nil {
+		return nil, mapOllamaOpenAIError(err, o.ModelID())
+	}
+	if len(response.Choices) == 0 {
+		return nil, errors.WithFields(
+			errors.New(errors.InvalidResponse, "no choices in response"),
+			errors.Fields{"model": o.ModelID()})
+	}
+
+	return &core.LLMResponse{
+		Content: response.Choices[0].Message.Content,
+		Usage: &core.TokenInfo{
+			PromptTokens:     int(response.Usage.PromptTokens),
+			CompletionTokens: int(response.Usage.CompletionTokens),
+			TotalTokens:      int(response.Usage.TotalTokens),
+		},
+		Metadata: map[string]interface{}{
+			"model": response.Model,
+			"mode":  "openai",
+		},
+	}, nil
+}
+
+func (o *OllamaLLM) streamGenerateWithContentOpenAI(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.StreamResponse, error) {
+	opts := core.NewGenerateOptions()
+	for _, opt := range options {
+		opt(opts)
+	}
+
+	parts, err := convertContentBlocksToOpenAIParts(content)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) == 0 {
+		return nil, errors.New(errors.InvalidInput, "no content provided")
+	}
+
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaiUserMessageFromParts(parts),
+		},
+	}
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
+
+	chunkChan := make(chan core.StreamChunk)
+	streamCtx, cancelStream := context.WithCancel(ctx)
+
+	go func() {
+		defer close(chunkChan)
+		defer cancelStream()
+
+		stream := o.openaiClient.Chat.Completions.NewStreaming(streamCtx, params)
+		defer func() {
+			_ = stream.Close()
+		}()
+
+		pumpOpenAIChatCompletionStream(streamCtx, stream, chunkChan)
+	}()
+
+	return &core.StreamResponse{
+		ChunkChannel: chunkChan,
+		Cancel:       cancelStream,
+	}, nil
+}
+
+func (o *OllamaLLM) generateWithContentNative(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.LLMResponse, error) {
+	opts := core.NewGenerateOptions()
+	for _, opt := range options {
+		opt(opts)
+	}
+
+	message := buildOllamaNativeUserMessage(content)
+	streamFalse := false
+	req := &ollamaapi.ChatRequest{
+		Model:    string(o.ModelID()),
+		Messages: []ollamaapi.Message{message},
+		Stream:   &streamFalse,
+		Options:  buildOllamaNativeOptions(opts),
+	}
+
+	var lastResp ollamaapi.ChatResponse
+	var received bool
+	err := o.nativeClient.Chat(ctx, req, func(r ollamaapi.ChatResponse) error {
+		lastResp = r
+		received = true
+		return nil
+	})
+	if err != nil {
+		return nil, mapOllamaNativeError(err, o.ModelID())
+	}
+	if !received {
+		return nil, errors.WithFields(
+			errors.New(errors.LLMGenerationFailed, "ollama native API returned no response"),
+			errors.Fields{"model": o.ModelID()})
+	}
+
+	return &core.LLMResponse{
+		Content: lastResp.Message.Content,
+		Metadata: map[string]interface{}{
+			"model": lastResp.Model,
+			"mode":  "native",
+		},
+	}, nil
+}
+
+func (o *OllamaLLM) streamGenerateWithContentNative(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.StreamResponse, error) {
+	opts := core.NewGenerateOptions()
+	for _, opt := range options {
+		opt(opts)
+	}
+
+	message := buildOllamaNativeUserMessage(content)
+	streamTrue := true
+	req := &ollamaapi.ChatRequest{
+		Model:    string(o.ModelID()),
+		Messages: []ollamaapi.Message{message},
+		Stream:   &streamTrue,
+		Options:  buildOllamaNativeOptions(opts),
+	}
+
+	chunkChan := make(chan core.StreamChunk)
+	streamCtx, cancelStream := context.WithCancel(ctx)
+
+	go func() {
+		defer close(chunkChan)
+
+		err := o.nativeClient.Chat(streamCtx, req, func(r ollamaapi.ChatResponse) error {
+			if err := streamCtx.Err(); err != nil {
+				return err
+			}
+			if r.Message.Content != "" {
+				select {
+				case chunkChan <- core.StreamChunk{Content: r.Message.Content}:
+				case <-streamCtx.Done():
+					return streamCtx.Err()
+				}
+			}
+			if r.Done {
+				select {
+				case chunkChan <- core.StreamChunk{Done: true}:
+				case <-streamCtx.Done():
+					return streamCtx.Err()
+				}
+			}
+			return nil
+		})
+		if err != nil && !stderrors.Is(err, context.Canceled) {
+			select {
+			case chunkChan <- core.StreamChunk{Error: mapOllamaNativeError(err, o.ModelID())}:
+			case <-streamCtx.Done():
+			}
+		}
+	}()
+
+	return &core.StreamResponse{
+		ChunkChannel: chunkChan,
+		Cancel:       cancelStream,
+	}, nil
+}
+
+// buildOllamaNativeUserMessage flattens text blocks into a single Content
+// string and gathers image blocks as raw byte slices on the Images field, the
+// shape Ollama's native /api/chat endpoint expects. Audio is not supported by
+// Ollama natively and is dropped with a textual placeholder.
+func buildOllamaNativeUserMessage(content []core.ContentBlock) ollamaapi.Message {
+	var textParts []string
+	var images []ollamaapi.ImageData
 	for _, block := range content {
-		if block.Type == core.FieldTypeText {
-			textContent += block.Text + "\n"
+		switch block.Type {
+		case core.FieldTypeText:
+			if block.Text != "" {
+				textParts = append(textParts, block.Text)
+			}
+		case core.FieldTypeImage:
+			if len(block.Data) > 0 {
+				img := make([]byte, len(block.Data))
+				copy(img, block.Data)
+				images = append(images, ollamaapi.ImageData(img))
+			}
+		case core.FieldTypeAudio:
+			textParts = append(textParts, fmt.Sprintf("[Audio: %s]", block.MimeType))
 		}
 	}
-
-	if textContent == "" {
-		return nil, errors.WithFields(
-			errors.New(errors.UnsupportedOperation, "multimodal streaming not yet supported for Ollama"),
-			errors.Fields{
-				"provider": "ollama",
-				"model":    o.ModelID(),
-			})
+	return ollamaapi.Message{
+		Role:    "user",
+		Content: strings.Join(textParts, "\n"),
+		Images:  images,
 	}
+}
 
-	return o.StreamGenerate(ctx, strings.TrimSpace(textContent), options...)
+func ollamaContentHasNonText(blocks []core.ContentBlock) bool {
+	for _, block := range blocks {
+		if block.Type != core.FieldTypeText {
+			return true
+		}
+	}
+	return false
+}
+
+func ollamaJoinTextBlocks(blocks []core.ContentBlock) string {
+	var parts []string
+	for _, block := range blocks {
+		if block.Type == core.FieldTypeText && block.Text != "" {
+			parts = append(parts, block.Text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
 }
 
 // CreateEmbeddings generates embeddings for multiple inputs.

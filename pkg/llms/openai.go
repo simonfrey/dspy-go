@@ -3,6 +3,7 @@ package llms
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	stderrors "errors"
@@ -739,6 +740,173 @@ func buildOpenAIToolResultFromSDK(choice openaisdk.ChatCompletionChoice, usage o
 	}
 
 	return result, nil
+}
+
+// GenerateWithContent generates a response from a multimodal content prompt.
+// Images and other binary inputs are forwarded to the model as user-message
+// content parts; they are passed through and not retained for training.
+func (o *OpenAILLM) GenerateWithContent(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.LLMResponse, error) {
+	opts := core.NewGenerateOptions()
+	for _, opt := range options {
+		opt(opts)
+	}
+
+	parts, err := convertContentBlocksToOpenAIParts(content)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) == 0 {
+		return nil, errors.New(errors.InvalidInput, "no content provided")
+	}
+
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaiUserMessageFromParts(parts),
+		},
+	}
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
+
+	response, err := o.chatCompletion(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(response.Choices) == 0 {
+		return nil, errors.New(errors.InvalidResponse, "no choices returned from OpenAI API")
+	}
+
+	usage := &core.TokenInfo{
+		PromptTokens:     int(response.Usage.PromptTokens),
+		CompletionTokens: int(response.Usage.CompletionTokens),
+		TotalTokens:      int(response.Usage.TotalTokens),
+	}
+
+	return &core.LLMResponse{
+		Content: response.Choices[0].Message.Content,
+		Usage:   usage,
+		Metadata: map[string]interface{}{
+			"finish_reason": response.Choices[0].FinishReason,
+			"id":            response.ID,
+			"model":         response.Model,
+		},
+	}, nil
+}
+
+// StreamGenerateWithContent streams a response from a multimodal content prompt.
+func (o *OpenAILLM) StreamGenerateWithContent(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.StreamResponse, error) {
+	opts := core.NewGenerateOptions()
+	for _, opt := range options {
+		opt(opts)
+	}
+
+	parts, err := convertContentBlocksToOpenAIParts(content)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) == 0 {
+		return nil, errors.New(errors.InvalidInput, "no content provided")
+	}
+
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaiUserMessageFromParts(parts),
+		},
+	}
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
+
+	chunkChan := make(chan core.StreamChunk)
+	streamCtx, cancelFunc := context.WithCancel(ctx)
+
+	go func() {
+		defer close(chunkChan)
+		defer cancelFunc()
+
+		stream := o.client.Chat.Completions.NewStreaming(streamCtx, params)
+		defer func() {
+			_ = stream.Close()
+		}()
+
+		pumpOpenAIChatCompletionStream(streamCtx, stream, chunkChan)
+	}()
+
+	return &core.StreamResponse{
+		ChunkChannel: chunkChan,
+		Cancel:       cancelFunc,
+	}, nil
+}
+
+// convertContentBlocksToOpenAIParts converts a slice of core.ContentBlock into
+// the openai-go SDK's ChatCompletionContentPartUnionParam slice. Image and
+// audio blocks are encoded as base64 data URLs / inline blobs as required by
+// the API. Unsupported types fall back to a textual placeholder so the prompt
+// remains coherent. Empty input returns an empty slice.
+func convertContentBlocksToOpenAIParts(blocks []core.ContentBlock) ([]openaisdk.ChatCompletionContentPartUnionParam, error) {
+	if len(blocks) == 0 {
+		return nil, nil
+	}
+	parts := make([]openaisdk.ChatCompletionContentPartUnionParam, 0, len(blocks))
+	for _, block := range blocks {
+		switch block.Type {
+		case core.FieldTypeText:
+			if block.Text == "" {
+				continue
+			}
+			parts = append(parts, openaisdk.TextContentPart(block.Text))
+		case core.FieldTypeImage:
+			if len(block.Data) == 0 {
+				return nil, errors.New(errors.InvalidInput, "image content block has no data")
+			}
+			mimeType := block.MimeType
+			if mimeType == "" {
+				mimeType = "image/png"
+			}
+			dataURL := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(block.Data)
+			parts = append(parts, openaisdk.ImageContentPart(openaisdk.ChatCompletionContentPartImageImageURLParam{
+				URL: dataURL,
+			}))
+		case core.FieldTypeAudio:
+			if len(block.Data) == 0 {
+				return nil, errors.New(errors.InvalidInput, "audio content block has no data")
+			}
+			format := openAIAudioFormatFromMimeType(block.MimeType)
+			parts = append(parts, openaisdk.InputAudioContentPart(openaisdk.ChatCompletionContentPartInputAudioInputAudioParam{
+				Data:   base64.StdEncoding.EncodeToString(block.Data),
+				Format: format,
+			}))
+		default:
+			if text := strings.TrimSpace(block.String()); text != "" {
+				parts = append(parts, openaisdk.TextContentPart(text))
+			}
+		}
+	}
+	return parts, nil
+}
+
+// openaiUserMessageFromParts wraps content parts into a user-role message.
+func openaiUserMessageFromParts(parts []openaisdk.ChatCompletionContentPartUnionParam) openaisdk.ChatCompletionMessageParamUnion {
+	user := openaisdk.ChatCompletionUserMessageParam{
+		Content: openaisdk.ChatCompletionUserMessageParamContentUnion{
+			OfArrayOfContentParts: parts,
+		},
+	}
+	return openaisdk.ChatCompletionMessageParamUnion{OfUser: &user}
+}
+
+// openAIAudioFormatFromMimeType maps a MIME type to the SDK's accepted audio
+// format string. The SDK validator only allows "wav" and "mp3"; any other
+// value defaults to "wav" so the request still serializes.
+func openAIAudioFormatFromMimeType(mimeType string) string {
+	mt := strings.ToLower(strings.TrimSpace(mimeType))
+	switch {
+	case strings.Contains(mt, "mp3"), strings.Contains(mt, "mpeg"):
+		return "mp3"
+	case strings.Contains(mt, "wav"):
+		return "wav"
+	default:
+		return "wav"
+	}
 }
 
 // CreateEmbedding implements the core.LLM interface.

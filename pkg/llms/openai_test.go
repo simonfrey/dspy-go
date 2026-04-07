@@ -371,6 +371,106 @@ func TestOpenAILLM_Generate(t *testing.T) {
 	}
 }
 
+func TestOpenAILLM_GenerateWithContent_Multimodal(t *testing.T) {
+	var receivedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read request body: %v", err)
+		}
+		receivedBody = body
+
+		response := openai.ChatCompletionResponse{
+			ID:      "test-id",
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   "gpt-4o",
+			Choices: []openai.ChatChoice{{
+				Index: 0,
+				Message: openai.ChatCompletionMessage{
+					Role:    "assistant",
+					Content: "I see a small image.",
+				},
+				FinishReason: "stop",
+			}},
+			Usage: openai.CompletionUsage{PromptTokens: 30, CompletionTokens: 5, TotalTokens: 35},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			t.Fatalf("failed to encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	llm, err := NewOpenAILLMFromConfig(ctx, core.ProviderConfig{
+		Name:   "openai",
+		APIKey: "test-api-key",
+		Endpoint: &core.EndpointConfig{
+			BaseURL:    server.URL,
+			TimeoutSec: 30,
+		},
+	}, core.ModelOpenAIGPT4o)
+	require.NoError(t, err)
+
+	imageBytes := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+	content := []core.ContentBlock{
+		core.NewTextBlock("What's in this image?"),
+		core.NewImageBlock(imageBytes, "image/png"),
+	}
+
+	resp, err := llm.GenerateWithContent(ctx, content)
+	require.NoError(t, err)
+	assert.Equal(t, "I see a small image.", resp.Content)
+	require.NotNil(t, resp.Usage)
+	assert.Equal(t, 30, resp.Usage.PromptTokens)
+
+	// Inspect the wire format - we expect a user message with an array of
+	// content parts containing one text part and one image_url part whose URL
+	// is a base64 data URL.
+	var decoded struct {
+		Messages []struct {
+			Role    string            `json:"role"`
+			Content []json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	require.NoError(t, json.Unmarshal(receivedBody, &decoded))
+	require.Len(t, decoded.Messages, 1)
+	assert.Equal(t, "user", decoded.Messages[0].Role)
+	require.Len(t, decoded.Messages[0].Content, 2)
+
+	var textPart struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	require.NoError(t, json.Unmarshal(decoded.Messages[0].Content[0], &textPart))
+	assert.Equal(t, "text", textPart.Type)
+	assert.Equal(t, "What's in this image?", textPart.Text)
+
+	var imagePart struct {
+		Type     string `json:"type"`
+		ImageURL struct {
+			URL string `json:"url"`
+		} `json:"image_url"`
+	}
+	require.NoError(t, json.Unmarshal(decoded.Messages[0].Content[1], &imagePart))
+	assert.Equal(t, "image_url", imagePart.Type)
+	assert.True(t, strings.HasPrefix(imagePart.ImageURL.URL, "data:image/png;base64,"),
+		"expected data URL with image/png prefix, got %q", imagePart.ImageURL.URL)
+	assert.Contains(t, imagePart.ImageURL.URL, "iVBORw0KGgo=") // base64 of the PNG header bytes
+}
+
+func TestOpenAILLM_GenerateWithContent_RejectsEmptyImage(t *testing.T) {
+	llm, err := NewOpenAILLM(core.ModelOpenAIGPT4o, WithAPIKey("test"))
+	require.NoError(t, err)
+
+	_, err = llm.GenerateWithContent(context.Background(), []core.ContentBlock{
+		core.NewImageBlock(nil, "image/png"),
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "image content block has no data")
+}
+
 func TestOpenAILLM_GenerateWithJSON(t *testing.T) {
 	// Create a mock server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
