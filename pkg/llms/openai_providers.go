@@ -38,6 +38,7 @@ func NewLiteLLM(modelID core.ModelID, apiKey string, opts ...OpenAIOption) (*Ope
 	return &OpenAILLM{
 		BaseLLM: newBaseLLM,
 		apiKey:  llm.apiKey,
+		client:  llm.client,
 	}, nil
 }
 
@@ -68,6 +69,7 @@ func NewLocalAI(modelID core.ModelID, baseURL string, opts ...OpenAIOption) (*Op
 	return &OpenAILLM{
 		BaseLLM: newBaseLLM,
 		apiKey:  llm.apiKey,
+		client:  llm.client,
 	}, nil
 }
 
@@ -98,6 +100,7 @@ func NewFastChat(modelID core.ModelID, baseURL string, opts ...OpenAIOption) (*O
 	return &OpenAILLM{
 		BaseLLM: newBaseLLM,
 		apiKey:  llm.apiKey,
+		client:  llm.client,
 	}, nil
 }
 
@@ -123,6 +126,7 @@ func NewOpenAICompatible(provider string, modelID core.ModelID, baseURL string, 
 	return &OpenAILLM{
 		BaseLLM: newBaseLLM,
 		apiKey:  llm.apiKey,
+		client:  llm.client,
 	}, nil
 }
 

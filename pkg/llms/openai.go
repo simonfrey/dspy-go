@@ -1,22 +1,25 @@
 package llms
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	openaisdk "github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/packages/ssestream"
+	"github.com/openai/openai-go/v3/shared"
+
 	"github.com/XiaoConstantine/dspy-go/pkg/core"
 	"github.com/XiaoConstantine/dspy-go/pkg/errors"
-	"github.com/XiaoConstantine/dspy-go/pkg/llms/openai"
 	"github.com/XiaoConstantine/dspy-go/pkg/logging"
 	"github.com/XiaoConstantine/dspy-go/pkg/utils"
 )
@@ -25,6 +28,7 @@ import (
 type OpenAILLM struct {
 	*core.BaseLLM
 	apiKey string
+	client openaisdk.Client
 }
 
 // OpenAIOption is a functional option for configuring OpenAI provider.
@@ -75,7 +79,9 @@ func NewOpenAILLM(modelID core.ModelID, opts ...OpenAIOption) (*OpenAILLM, error
 			errors.Fields{"env_vars": "OPENAI_API_KEY or OPENAI_OAUTH_TOKEN"})
 	}
 
-	// Build endpoint configuration
+	// Build endpoint configuration. We continue to expose the endpoint config
+	// (including Authorization header) so callers and tests can introspect it,
+	// even though the underlying HTTP transport is now driven by the SDK.
 	endpointCfg := &core.EndpointConfig{
 		BaseURL:    config.baseURL,
 		Path:       config.path,
@@ -106,10 +112,63 @@ func NewOpenAILLM(modelID core.ModelID, opts ...OpenAIOption) (*OpenAILLM, error
 
 	baseLLM := core.NewBaseLLM("openai", modelID, capabilities, endpointCfg)
 
+	client := buildOpenAISDKClient(config)
+
 	return &OpenAILLM{
 		BaseLLM: baseLLM,
 		apiKey:  config.apiKey,
+		client:  client,
 	}, nil
+}
+
+// buildOpenAISDKClient constructs an openai-go SDK client from the user-supplied
+// configuration. It translates baseURL+path into the SDK's base URL convention
+// (which always ends in a trailing slash and has the route path appended) and
+// forwards any custom headers and HTTP client.
+func buildOpenAISDKClient(config *OpenAIConfig) openaisdk.Client {
+	sdkBase := computeOpenAISDKBaseURL(config.baseURL, config.path)
+
+	opts := []option.RequestOption{
+		option.WithBaseURL(sdkBase),
+		// Disable the SDK's automatic retries; the dspy-go layer manages its
+		// own retry semantics (notably the invalid_request_error JSON-parse
+		// fallback) and tests assert on exact request counts.
+		option.WithMaxRetries(0),
+	}
+	if config.apiKey != "" {
+		opts = append(opts, option.WithAPIKey(config.apiKey))
+	}
+	if config.httpClient != nil {
+		opts = append(opts, option.WithHTTPClient(config.httpClient))
+	}
+	for k, v := range config.headers {
+		// Skip headers the SDK manages itself.
+		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Content-Type") {
+			continue
+		}
+		opts = append(opts, option.WithHeader(k, v))
+	}
+	return openaisdk.NewClient(opts...)
+}
+
+// computeOpenAISDKBaseURL derives the SDK base URL from the legacy baseURL+path
+// pair. The SDK appends route paths like "chat/completions" and "embeddings"
+// directly to the base URL, so we strip a trailing chat/completions segment
+// from the legacy path and ensure a trailing slash.
+func computeOpenAISDKBaseURL(baseURL, path string) string {
+	full := strings.TrimRight(baseURL, "/")
+	if path != "" {
+		if !strings.HasPrefix(path, "/") {
+			full += "/"
+		}
+		full += path
+	}
+	full = strings.TrimSuffix(full, "/chat/completions")
+	full = strings.TrimSuffix(full, "chat/completions")
+	if !strings.HasSuffix(full, "/") {
+		full += "/"
+	}
+	return full
 }
 
 // Option functions for OpenAI configuration
@@ -258,18 +317,15 @@ func (o *OpenAILLM) Generate(ctx context.Context, prompt string, options ...core
 		opt(opts)
 	}
 
-	request := &openai.ChatCompletionRequest{
-		Model: o.ModelID(),
-		Messages: []openai.ChatCompletionMessage{
-			{
-				Role:    "user",
-				Content: prompt,
-			},
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaisdk.UserMessage(prompt),
 		},
 	}
-	request.ApplyOptions(coreOptsToOpenAI(opts))
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
 
-	response, err := o.makeRequest(ctx, request)
+	response, err := o.chatCompletion(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -279,9 +335,9 @@ func (o *OpenAILLM) Generate(ctx context.Context, prompt string, options ...core
 	}
 
 	usage := &core.TokenInfo{
-		PromptTokens:     response.Usage.PromptTokens,
-		CompletionTokens: response.Usage.CompletionTokens,
-		TotalTokens:      response.Usage.TotalTokens,
+		PromptTokens:     int(response.Usage.PromptTokens),
+		CompletionTokens: int(response.Usage.CompletionTokens),
+		TotalTokens:      int(response.Usage.TotalTokens),
 	}
 
 	return &core.LLMResponse{
@@ -302,21 +358,18 @@ func (o *OpenAILLM) GenerateWithJSON(ctx context.Context, prompt string, options
 		opt(opts)
 	}
 
-	request := &openai.ChatCompletionRequest{
-		Model: o.ModelID(),
-		Messages: []openai.ChatCompletionMessage{
-			{
-				Role:    "user",
-				Content: prompt,
-			},
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaisdk.UserMessage(prompt),
 		},
-		ResponseFormat: &openai.ResponseFormat{
-			Type: "json_object",
+		ResponseFormat: openaisdk.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONObject: &shared.ResponseFormatJSONObjectParam{},
 		},
 	}
-	request.ApplyOptions(coreOptsToOpenAI(opts))
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
 
-	response, err := o.makeRequest(ctx, request)
+	response, err := o.chatCompletion(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -339,25 +392,24 @@ func (o *OpenAILLM) GenerateWithFunctions(ctx context.Context, prompt string, fu
 		opt(opts)
 	}
 
-	tools, err := convertOpenAIFunctionSchemas(functions)
+	tools, err := convertOpenAIFunctionSchemasToSDK(functions)
 	if err != nil {
 		return nil, err
 	}
 
-	request := &openai.ChatCompletionRequest{
-		Model: o.ModelID(),
-		Messages: []openai.ChatCompletionMessage{
-			{
-				Role:    "user",
-				Content: prompt,
-			},
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaisdk.UserMessage(prompt),
 		},
-		Tools:      tools,
-		ToolChoice: "auto",
+		Tools: tools,
+		ToolChoice: openaisdk.ChatCompletionToolChoiceOptionUnionParam{
+			OfAuto: param.NewOpt("auto"),
+		},
 	}
-	request.ApplyOptions(coreOptsToOpenAI(opts))
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
 
-	response, err := o.makeRequest(ctx, request)
+	response, err := o.chatCompletion(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +418,7 @@ func (o *OpenAILLM) GenerateWithFunctions(ctx context.Context, prompt string, fu
 		return nil, errors.New(errors.InvalidResponse, "no choices returned from OpenAI API")
 	}
 
-	return buildOpenAIToolResult(response.Choices[0], response.Usage, "functions")
+	return buildOpenAIToolResultFromSDK(response.Choices[0], response.Usage, "functions")
 }
 
 // GenerateWithTools implements native multi-turn tool calling for OpenAI.
@@ -380,25 +432,27 @@ func (o *OpenAILLM) GenerateWithTools(ctx context.Context, messages []core.ChatM
 		opt(opts)
 	}
 
-	openAIMessages, err := convertCoreChatMessagesToOpenAI(messages)
+	openAIMessages, err := convertCoreChatMessagesToOpenAISDK(messages)
 	if err != nil {
 		return nil, err
 	}
 
-	openAITools, err := convertOpenAIAnyToolSchemas(tools)
+	openAITools, err := convertOpenAIAnyToolSchemasToSDK(tools)
 	if err != nil {
 		return nil, err
 	}
 
-	request := &openai.ChatCompletionRequest{
-		Model:      o.ModelID(),
-		Messages:   openAIMessages,
-		Tools:      openAITools,
-		ToolChoice: "auto",
+	params := openaisdk.ChatCompletionNewParams{
+		Model:    shared.ChatModel(o.ModelID()),
+		Messages: openAIMessages,
+		Tools:    openAITools,
+		ToolChoice: openaisdk.ChatCompletionToolChoiceOptionUnionParam{
+			OfAuto: param.NewOpt("auto"),
+		},
 	}
-	request.ApplyOptions(coreOptsToOpenAI(opts))
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
 
-	response, err := o.makeRequest(ctx, request)
+	response, err := o.chatCompletion(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -407,11 +461,11 @@ func (o *OpenAILLM) GenerateWithTools(ctx context.Context, messages []core.ChatM
 		return nil, errors.New(errors.InvalidResponse, "no choices returned from OpenAI API")
 	}
 
-	return buildOpenAIToolResult(response.Choices[0], response.Usage, "tools")
+	return buildOpenAIToolResultFromSDK(response.Choices[0], response.Usage, "tools")
 }
 
-func convertOpenAIFunctionSchemas(functions []map[string]interface{}) ([]openai.ChatCompletionTool, error) {
-	tools := make([]openai.ChatCompletionTool, 0, len(functions))
+func convertOpenAIFunctionSchemasToSDK(functions []map[string]interface{}) ([]openaisdk.ChatCompletionToolUnionParam, error) {
+	tools := make([]openaisdk.ChatCompletionToolUnionParam, 0, len(functions))
 
 	for _, function := range functions {
 		name, ok := function["name"].(string)
@@ -421,7 +475,7 @@ func convertOpenAIFunctionSchemas(functions []map[string]interface{}) ([]openai.
 
 		description, _ := function["description"].(string)
 
-		parameters := map[string]interface{}{"type": "object"}
+		parameters := shared.FunctionParameters{"type": "object"}
 		if rawParameters, hasParameters := function["parameters"]; hasParameters && rawParameters != nil {
 			paramMap, ok := rawParameters.(map[string]interface{})
 			if !ok {
@@ -431,18 +485,23 @@ func convertOpenAIFunctionSchemas(functions []map[string]interface{}) ([]openai.
 				)
 			}
 
-			parameters = cloneMap(paramMap)
+			parameters = shared.FunctionParameters(cloneMap(paramMap))
 			if _, hasType := parameters["type"]; !hasType {
 				parameters["type"] = "object"
 			}
 		}
 
-		tools = append(tools, openai.ChatCompletionTool{
-			Type: "function",
-			Function: openai.ChatCompletionFunction{
-				Name:        name,
-				Description: description,
-				Parameters:  parameters,
+		functionDef := shared.FunctionDefinitionParam{
+			Name:       name,
+			Parameters: parameters,
+		}
+		if description != "" {
+			functionDef.Description = param.NewOpt(description)
+		}
+
+		tools = append(tools, openaisdk.ChatCompletionToolUnionParam{
+			OfFunction: &openaisdk.ChatCompletionFunctionToolParam{
+				Function: functionDef,
 			},
 		})
 	}
@@ -450,12 +509,12 @@ func convertOpenAIFunctionSchemas(functions []map[string]interface{}) ([]openai.
 	return tools, nil
 }
 
-func convertOpenAIAnyToolSchemas(functions []map[string]any) ([]openai.ChatCompletionTool, error) {
+func convertOpenAIAnyToolSchemasToSDK(functions []map[string]any) ([]openaisdk.ChatCompletionToolUnionParam, error) {
 	converted := make([]map[string]interface{}, 0, len(functions))
 	for _, function := range functions {
 		converted = append(converted, anyMapToInterfaceMap(function))
 	}
-	return convertOpenAIFunctionSchemas(converted)
+	return convertOpenAIFunctionSchemasToSDK(converted)
 }
 
 func parseOpenAIFunctionArguments(raw string) (map[string]interface{}, error) {
@@ -493,21 +552,38 @@ func anyMapToInterfaceMap(in map[string]any) map[string]interface{} {
 	return out
 }
 
-func convertCoreChatMessagesToOpenAI(messages []core.ChatMessage) ([]openai.ChatCompletionMessage, error) {
-	out := make([]openai.ChatCompletionMessage, 0, len(messages))
+// convertCoreChatMessagesToOpenAISDK translates dspy-go's core.ChatMessage values
+// (which can carry assistant tool calls and tool results) into the openai-go
+// SDK's ChatCompletionMessageParamUnion. The pendingToolCallIDs bookkeeping is
+// the same as the previous hand-rolled converter: a tool result whose ToolCallID
+// is unset is implicitly bound to the immediately preceding assistant turn IFF
+// that turn produced exactly one tool call. Multi-call ambiguity is rejected.
+func convertCoreChatMessagesToOpenAISDK(messages []core.ChatMessage) ([]openaisdk.ChatCompletionMessageParamUnion, error) {
+	out := make([]openaisdk.ChatCompletionMessageParamUnion, 0, len(messages))
 	pendingToolCallIDs := make([]string, 0, 1)
 
 	for messageIndex, message := range messages {
-		openAIMessage := openai.ChatCompletionMessage{
-			Role:    strings.TrimSpace(message.Role),
-			Content: flattenCoreChatMessageContent(message.Content),
-		}
+		role := strings.TrimSpace(message.Role)
+		content := flattenCoreChatMessageContent(message.Content)
 
-		switch openAIMessage.Role {
+		switch role {
+		case "system":
+			out = append(out, openaisdk.SystemMessage(content))
+			pendingToolCallIDs = pendingToolCallIDs[:0]
+		case "developer":
+			out = append(out, openaisdk.DeveloperMessage(content))
+			pendingToolCallIDs = pendingToolCallIDs[:0]
+		case "user":
+			out = append(out, openaisdk.UserMessage(content))
+			pendingToolCallIDs = pendingToolCallIDs[:0]
 		case "assistant":
+			asst := openaisdk.ChatCompletionAssistantMessageParam{}
+			if content != "" {
+				asst.Content.OfString = param.NewOpt(content)
+			}
 			if len(message.ToolCalls) > 0 {
-				openAIMessage.ToolCalls = make([]openai.ChatCompletionToolCall, 0, len(message.ToolCalls))
 				pendingToolCallIDs = pendingToolCallIDs[:0]
+				asst.ToolCalls = make([]openaisdk.ChatCompletionMessageToolCallUnionParam, 0, len(message.ToolCalls))
 				for toolIndex, toolCall := range message.ToolCalls {
 					argumentsJSON, err := json.Marshal(toolCall.Arguments)
 					if err != nil {
@@ -523,27 +599,32 @@ func convertCoreChatMessagesToOpenAI(messages []core.ChatMessage) ([]openai.Chat
 					}
 					pendingToolCallIDs = append(pendingToolCallIDs, toolCallID)
 
-					openAIMessage.ToolCalls = append(openAIMessage.ToolCalls, openai.ChatCompletionToolCall{
-						ID:   toolCallID,
-						Type: "function",
-						Function: openai.ChatCompletionFunctionCallDelta{
-							Name:      toolCall.Name,
-							Arguments: string(argumentsJSON),
+					asst.ToolCalls = append(asst.ToolCalls, openaisdk.ChatCompletionMessageToolCallUnionParam{
+						OfFunction: &openaisdk.ChatCompletionMessageFunctionToolCallParam{
+							ID: toolCallID,
+							Function: openaisdk.ChatCompletionMessageFunctionToolCallFunctionParam{
+								Name:      toolCall.Name,
+								Arguments: string(argumentsJSON),
+							},
 						},
 					})
 				}
 			} else {
 				pendingToolCallIDs = pendingToolCallIDs[:0]
 			}
+			out = append(out, openaisdk.ChatCompletionMessageParamUnion{OfAssistant: &asst})
 		case "tool":
+			toolMsg := openaisdk.ChatCompletionToolMessageParam{}
 			if message.ToolResult != nil {
-				openAIMessage.Content = flattenCoreChatMessageContent(message.ToolResult.Content)
-				openAIMessage.ToolCallID = strings.TrimSpace(message.ToolResult.ToolCallID)
-				if openAIMessage.ToolCallID == "" {
+				toolContent := flattenCoreChatMessageContent(message.ToolResult.Content)
+				toolMsg.Content.OfString = param.NewOpt(toolContent)
+
+				toolCallID := strings.TrimSpace(message.ToolResult.ToolCallID)
+				if toolCallID == "" {
 					switch len(pendingToolCallIDs) {
 					case 0:
 					case 1:
-						openAIMessage.ToolCallID = pendingToolCallIDs[0]
+						toolCallID = pendingToolCallIDs[0]
 					default:
 						return nil, errors.Wrap(
 							fmt.Errorf("assistant turn has %d pending tool calls", len(pendingToolCallIDs)),
@@ -552,15 +633,17 @@ func convertCoreChatMessagesToOpenAI(messages []core.ChatMessage) ([]openai.Chat
 						)
 					}
 				}
-				if openAIMessage.ToolCallID != "" {
-					pendingToolCallIDs = removePendingToolCallID(pendingToolCallIDs, openAIMessage.ToolCallID)
+				toolMsg.ToolCallID = toolCallID
+				if toolCallID != "" {
+					pendingToolCallIDs = removePendingToolCallID(pendingToolCallIDs, toolCallID)
 				}
 			}
+			out = append(out, openaisdk.ChatCompletionMessageParamUnion{OfTool: &toolMsg})
 		default:
+			// Unknown roles fall back to user content to keep prior behavior.
+			out = append(out, openaisdk.UserMessage(content))
 			pendingToolCallIDs = pendingToolCallIDs[:0]
 		}
-
-		out = append(out, openAIMessage)
 	}
 
 	return out, nil
@@ -592,7 +675,11 @@ func flattenCoreChatMessageContent(blocks []core.ContentBlock) string {
 	return strings.Join(parts, "\n")
 }
 
-func buildOpenAIToolResult(choice openai.ChatChoice, usage openai.CompletionUsage, mode string) (map[string]interface{}, error) {
+// buildOpenAIToolResultFromSDK shapes an SDK ChatCompletionChoice into the
+// historical map[string]interface{} contract: a "tool_calls" slice of
+// core.ToolCall, plus a "function_call" convenience map for legacy callers,
+// plus token usage on "_usage".
+func buildOpenAIToolResultFromSDK(choice openaisdk.ChatCompletionChoice, usage openaisdk.CompletionUsage, mode string) (map[string]interface{}, error) {
 	result := map[string]interface{}{}
 
 	if content := strings.TrimSpace(choice.Message.Content); content != "" {
@@ -602,16 +689,17 @@ func buildOpenAIToolResult(choice openai.ChatChoice, usage openai.CompletionUsag
 	if len(choice.Message.ToolCalls) > 0 {
 		toolCalls := make([]core.ToolCall, 0, len(choice.Message.ToolCalls))
 		for _, call := range choice.Message.ToolCalls {
-			args, err := parseOpenAIFunctionArguments(call.Function.Arguments)
+			fn := call.AsFunction()
+			args, err := parseOpenAIFunctionArguments(fn.Function.Arguments)
 			if err != nil {
 				return nil, errors.WithFields(
 					errors.Wrap(err, errors.InvalidResponse, "failed to parse tool call arguments"),
-					errors.Fields{"tool_name": call.Function.Name},
+					errors.Fields{"tool_name": fn.Function.Name},
 				)
 			}
 			toolCalls = append(toolCalls, core.ToolCall{
-				ID:        call.ID,
-				Name:      call.Function.Name,
+				ID:        fn.ID,
+				Name:      fn.Function.Name,
 				Arguments: args,
 			})
 		}
@@ -620,7 +708,7 @@ func buildOpenAIToolResult(choice openai.ChatChoice, usage openai.CompletionUsag
 			"name":      toolCalls[0].Name,
 			"arguments": toolCalls[0].Arguments,
 		}
-	} else if choice.Message.FunctionCall != nil && choice.Message.FunctionCall.Name != "" {
+	} else if choice.Message.FunctionCall.Name != "" {
 		args, err := parseOpenAIFunctionArguments(choice.Message.FunctionCall.Arguments)
 		if err != nil {
 			return nil, errors.WithFields(
@@ -645,9 +733,9 @@ func buildOpenAIToolResult(choice openai.ChatChoice, usage openai.CompletionUsag
 	}
 
 	result["_usage"] = &core.TokenInfo{
-		PromptTokens:     usage.PromptTokens,
-		CompletionTokens: usage.CompletionTokens,
-		TotalTokens:      usage.TotalTokens,
+		PromptTokens:     int(usage.PromptTokens),
+		CompletionTokens: int(usage.CompletionTokens),
+		TotalTokens:      int(usage.TotalTokens),
 	}
 
 	return result, nil
@@ -665,22 +753,23 @@ func (o *OpenAILLM) CreateEmbedding(ctx context.Context, input string, options .
 		model = opts.Model
 	}
 
-	request := &openai.EmbeddingRequest{
-		Input:          input,
-		Model:          model,
-		EncodingFormat: "float",
+	params := openaisdk.EmbeddingNewParams{
+		Input: openaisdk.EmbeddingNewParamsInputUnion{
+			OfString: param.NewOpt(input),
+		},
+		Model:          openaisdk.EmbeddingModel(model),
+		EncodingFormat: openaisdk.EmbeddingNewParamsEncodingFormatFloat,
 	}
 
-	response, err := o.makeEmbeddingRequest(ctx, request)
+	response, err := o.client.Embeddings.New(ctx, params)
 	if err != nil {
-		return nil, err
+		return nil, mapOpenAISDKError(err)
 	}
 
 	if len(response.Data) == 0 {
 		return nil, errors.New(errors.InvalidResponse, "no embeddings returned from OpenAI API")
 	}
 
-	// Convert []float64 to []float32
 	embedding := make([]float32, len(response.Data[0].Embedding))
 	for i, v := range response.Data[0].Embedding {
 		embedding[i] = float32(v)
@@ -688,7 +777,7 @@ func (o *OpenAILLM) CreateEmbedding(ctx context.Context, input string, options .
 
 	return &core.EmbeddingResult{
 		Vector:     embedding,
-		TokenCount: response.Usage.TotalTokens,
+		TokenCount: int(response.Usage.TotalTokens),
 		Metadata: map[string]interface{}{
 			"model": response.Model,
 		},
@@ -707,31 +796,36 @@ func (o *OpenAILLM) CreateEmbeddings(ctx context.Context, inputs []string, optio
 		model = opts.Model
 	}
 
-	request := &openai.EmbeddingRequest{
-		Input:          inputs,
-		Model:          model,
-		EncodingFormat: "float",
+	params := openaisdk.EmbeddingNewParams{
+		Input: openaisdk.EmbeddingNewParamsInputUnion{
+			OfArrayOfStrings: inputs,
+		},
+		Model:          openaisdk.EmbeddingModel(model),
+		EncodingFormat: openaisdk.EmbeddingNewParamsEncodingFormatFloat,
 	}
 
-	response, err := o.makeEmbeddingRequest(ctx, request)
+	response, err := o.client.Embeddings.New(ctx, params)
 	if err != nil {
-		return &core.BatchEmbeddingResult{Error: err}, nil
+		return &core.BatchEmbeddingResult{Error: mapOpenAISDKError(err)}, nil
 	}
 
 	results := make([]core.EmbeddingResult, len(response.Data))
 	for i, data := range response.Data {
-		// Convert []float64 to []float32
 		embedding := make([]float32, len(data.Embedding))
 		for j, v := range data.Embedding {
 			embedding[j] = float32(v)
 		}
 
+		perInputTokens := 0
+		if len(inputs) > 0 {
+			perInputTokens = int(response.Usage.TotalTokens) / len(inputs)
+		}
 		results[i] = core.EmbeddingResult{
 			Vector:     embedding,
-			TokenCount: response.Usage.TotalTokens / len(inputs), // Approximate per input
+			TokenCount: perInputTokens,
 			Metadata: map[string]interface{}{
 				"model": response.Model,
-				"index": data.Index,
+				"index": int(data.Index),
 			},
 		}
 	}
@@ -743,102 +837,32 @@ func (o *OpenAILLM) CreateEmbeddings(ctx context.Context, inputs []string, optio
 
 // StreamGenerate implements the core.LLM interface.
 func (o *OpenAILLM) StreamGenerate(ctx context.Context, prompt string, options ...core.GenerateOption) (*core.StreamResponse, error) {
-	logger := logging.GetLogger()
 	opts := core.NewGenerateOptions()
 	for _, opt := range options {
 		opt(opts)
 	}
 
-	request := &openai.ChatCompletionRequest{
-		Model: o.ModelID(),
-		Messages: []openai.ChatCompletionMessage{
-			{
-				Role:    "user",
-				Content: prompt,
-			},
+	params := openaisdk.ChatCompletionNewParams{
+		Model: shared.ChatModel(o.ModelID()),
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{
+			openaisdk.UserMessage(prompt),
 		},
-		Stream: true,
 	}
-	request.ApplyOptions(coreOptsToOpenAI(opts))
+	applyOpenAIGenerateOptions(&params, o.ModelID(), opts)
 
-	// Create a channel for the stream chunks
 	chunkChan := make(chan core.StreamChunk)
-
-	// Create a cancellable context
 	streamCtx, cancelFunc := context.WithCancel(ctx)
 
-	// Start a goroutine to handle the streaming request
 	go func() {
 		defer close(chunkChan)
 		defer cancelFunc()
 
-		resp, err := o.makeStreamingRequest(streamCtx, request)
-		if err != nil {
-			chunkChan <- core.StreamChunk{
-				Error: errors.Wrap(err, errors.LLMGenerationFailed, "streaming request failed"),
-			}
-			return
-		}
-		defer resp.Body.Close()
+		stream := o.client.Chat.Completions.NewStreaming(streamCtx, params)
+		defer func() {
+			_ = stream.Close()
+		}()
 
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			select {
-			case <-streamCtx.Done():
-				return
-			default:
-			}
-
-			line := scanner.Text()
-			line = strings.TrimSpace(line)
-
-			if line == "" {
-				continue
-			}
-
-			// Skip lines that don't start with "data: "
-			if !strings.HasPrefix(line, "data: ") {
-				continue
-			}
-
-			// Remove "data: " prefix
-			data := strings.TrimPrefix(line, "data: ")
-
-			// Check for end marker
-			if data == "[DONE]" {
-				chunkChan <- core.StreamChunk{Done: true}
-				return
-			}
-
-			// Parse the JSON response
-			var streamResponse openai.ChatCompletionStreamResponse
-			if err := json.Unmarshal([]byte(data), &streamResponse); err != nil {
-				logger.Debug(ctx, "Error parsing stream chunk: %v", err)
-				continue
-			}
-
-			// Process the response
-			if len(streamResponse.Choices) > 0 {
-				choice := streamResponse.Choices[0]
-				content := choice.Delta.Content
-
-				if content != "" {
-					chunkChan <- core.StreamChunk{Content: content}
-				}
-
-				// Check for finish reason
-				if choice.FinishReason != nil && *choice.FinishReason != "" {
-					chunkChan <- core.StreamChunk{Done: true}
-					return
-				}
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			chunkChan <- core.StreamChunk{
-				Error: errors.Wrap(err, errors.LLMGenerationFailed, "error reading stream"),
-			}
-		}
+		pumpOpenAIChatCompletionStream(streamCtx, stream, chunkChan)
 	}()
 
 	return &core.StreamResponse{
@@ -846,6 +870,196 @@ func (o *OpenAILLM) StreamGenerate(ctx context.Context, prompt string, options .
 		Cancel:       cancelFunc,
 	}, nil
 }
+
+// pumpOpenAIChatCompletionStream forwards chunks from the SDK ssestream to the
+// dspy-go channel contract. It mirrors the prior bufio-based reader: only
+// deltas with non-empty content emit a Content chunk, finish_reason emits a
+// Done chunk, and an SDK-level error becomes a wrapped LLMGenerationFailed
+// error. Shared between OpenAI and the Ollama OpenAI-compatible mode.
+func pumpOpenAIChatCompletionStream(ctx context.Context, stream *ssestream.Stream[openaisdk.ChatCompletionChunk], chunkChan chan<- core.StreamChunk) {
+	for stream.Next() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		chunk := stream.Current()
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		choice := chunk.Choices[0]
+		if choice.Delta.Content != "" {
+			select {
+			case chunkChan <- core.StreamChunk{Content: choice.Delta.Content}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if choice.FinishReason != "" {
+			select {
+			case chunkChan <- core.StreamChunk{Done: true}:
+			case <-ctx.Done():
+			}
+			return
+		}
+	}
+
+	if err := stream.Err(); err != nil {
+		select {
+		case chunkChan <- core.StreamChunk{
+			Error: errors.Wrap(err, errors.LLMGenerationFailed, "streaming request failed"),
+		}:
+		case <-ctx.Done():
+		}
+		return
+	}
+	// SDK closed cleanly without an explicit finish_reason — emit Done.
+	select {
+	case chunkChan <- core.StreamChunk{Done: true}:
+	case <-ctx.Done():
+	}
+}
+
+// chatCompletion sends a chat completion request, applying the dspy-go retry
+// quirk: a 400 invalid_request_error whose message indicates the API failed to
+// parse the JSON body is retried exactly once with `Connection: close` to
+// force a fresh TCP connection. This works around a sticky upstream bug where
+// kept-alive connections occasionally see a request body get truncated.
+func (o *OpenAILLM) chatCompletion(ctx context.Context, params openaisdk.ChatCompletionNewParams) (*openaisdk.ChatCompletion, error) {
+	return o.chatCompletionWithRetry(ctx, params, true)
+}
+
+func (o *OpenAILLM) chatCompletionWithRetry(ctx context.Context, params openaisdk.ChatCompletionNewParams, allowRetry bool) (*openaisdk.ChatCompletion, error) {
+	logger := logging.GetLogger()
+
+	var reqOpts []option.RequestOption
+	if !allowRetry {
+		reqOpts = append(reqOpts, option.WithHeader("Connection", "close"))
+	}
+
+	response, err := o.client.Chat.Completions.New(ctx, params, reqOpts...)
+	if err == nil {
+		return response, nil
+	}
+
+	var apiErr *openaisdk.Error
+	if !stderrors.As(err, &apiErr) {
+		return nil, errors.Wrap(err, errors.LLMGenerationFailed, "request failed")
+	}
+
+	fields := errors.Fields{
+		"type": apiErr.Type,
+		"code": apiErr.Code,
+	}
+	if apiErr.Type == "invalid_request_error" {
+		jsonData, _ := json.Marshal(params)
+		summary := summarizeOpenAIParams(&params, jsonData)
+		dumpPath, dumpErr := writeOpenAIInvalidRequestDebug(&params, jsonData, apiErr.StatusCode, []byte(apiErr.RawJSON()))
+		logger.Error(
+			ctx,
+			"OpenAI invalid request: model=%s body_bytes=%d messages=%d tools=%d tool_choice=%s max_tokens=%v max_completion_tokens=%v dump=%s response=%s",
+			summary.Model,
+			summary.BodyBytes,
+			summary.MessageCount,
+			summary.ToolCount,
+			summary.ToolChoice,
+			summary.MaxTokens,
+			summary.MaxCompletionTokens,
+			dumpPath,
+			strings.TrimSpace(apiErr.Message),
+		)
+		fields["request_body_bytes"] = summary.BodyBytes
+		fields["request_body_sha256"] = summary.BodySHA256
+		fields["message_count"] = summary.MessageCount
+		fields["tool_count"] = summary.ToolCount
+		fields["tool_choice"] = summary.ToolChoice
+		if dumpPath != "" {
+			fields["debug_dump"] = dumpPath
+		}
+		if dumpErr != nil {
+			fields["debug_dump_error"] = dumpErr.Error()
+		}
+		if allowRetry && shouldRetryOpenAIInvalidJSONMessage(apiErr.Message) {
+			logger.Warn(
+				ctx,
+				"Retrying OpenAI request after transient invalid_request_error with a fresh connection: model=%s dump=%s",
+				summary.Model,
+				dumpPath,
+			)
+			return o.chatCompletionWithRetry(ctx, params, false)
+		}
+	}
+
+	return nil, errors.WithFields(
+		errors.New(errors.LLMGenerationFailed, apiErr.Message),
+		fields)
+}
+
+// mapOpenAISDKError converts a non-retried SDK error into a dspy-go errors.Error.
+// Used for the embeddings code path which has no retry quirk.
+func mapOpenAISDKError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *openaisdk.Error
+	if stderrors.As(err, &apiErr) {
+		return errors.WithFields(
+			errors.New(errors.LLMGenerationFailed, apiErr.Message),
+			errors.Fields{"type": apiErr.Type, "code": apiErr.Code})
+	}
+	return errors.Wrap(err, errors.LLMGenerationFailed, "request failed")
+}
+
+func shouldRetryOpenAIInvalidJSONMessage(message string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(normalized, "parse the json body")
+}
+
+// applyOpenAIGenerateOptions translates core.GenerateOptions into the SDK's
+// ChatCompletionNewParams, preserving the historical model-aware behaviors:
+//   - GPT-5.x models route MaxTokens to MaxCompletionTokens.
+//   - GPT-5.x models do not support a custom Temperature; it is silently dropped.
+func applyOpenAIGenerateOptions(params *openaisdk.ChatCompletionNewParams, model string, opts *core.GenerateOptions) {
+	if opts == nil {
+		return
+	}
+
+	if opts.MaxTokens > 0 {
+		if openAIModelUsesMaxCompletionTokens(model) {
+			params.MaxCompletionTokens = param.NewOpt(int64(opts.MaxTokens))
+		} else {
+			params.MaxTokens = param.NewOpt(int64(opts.MaxTokens))
+		}
+	}
+	if opts.Temperature >= 0 && openAIModelSupportsCustomTemperature(model) {
+		params.Temperature = param.NewOpt(opts.Temperature)
+	}
+	if opts.TopP > 0 {
+		params.TopP = param.NewOpt(opts.TopP)
+	}
+	if opts.FrequencyPenalty != 0 {
+		params.FrequencyPenalty = param.NewOpt(opts.FrequencyPenalty)
+	}
+	if opts.PresencePenalty != 0 {
+		params.PresencePenalty = param.NewOpt(opts.PresencePenalty)
+	}
+	if len(opts.Stop) > 0 {
+		params.Stop = openaisdk.ChatCompletionNewParamsStopUnion{
+			OfStringArray: append([]string(nil), opts.Stop...),
+		}
+	}
+}
+
+func openAIModelUsesMaxCompletionTokens(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-5")
+}
+
+func openAIModelSupportsCustomTemperature(model string) bool {
+	return !openAIModelUsesMaxCompletionTokens(model)
+}
+
+// --- diagnostic dump helpers (used by the invalid_request_error path) ---
 
 type openAIMessageDebugSummary struct {
 	Role            string `json:"role"`
@@ -876,7 +1090,11 @@ type openAIInvalidRequestDebugDump struct {
 	ResponseBody   string                    `json:"response_body"`
 }
 
-func summarizeOpenAIRequest(request *openai.ChatCompletionRequest, jsonData []byte) openAIRequestDebugSummary {
+// summarizeOpenAIParams reads back fields from the marshaled JSON request body
+// because the SDK's param types are unions whose Go-level "set" state is not
+// trivially introspectable. Reading the JSON gives a single source of truth
+// that matches the wire format we actually sent.
+func summarizeOpenAIParams(params *openaisdk.ChatCompletionNewParams, jsonData []byte) openAIRequestDebugSummary {
 	summary := openAIRequestDebugSummary{
 		BodyBytes: len(jsonData),
 	}
@@ -884,37 +1102,78 @@ func summarizeOpenAIRequest(request *openai.ChatCompletionRequest, jsonData []by
 		hash := sha256.Sum256(jsonData)
 		summary.BodySHA256 = hex.EncodeToString(hash[:])
 	}
-	if request == nil {
+	if params == nil {
 		return summary
 	}
 
-	summary.Model = request.Model
-	summary.MessageCount = len(request.Messages)
-	summary.ToolCount = len(request.Tools)
-	summary.ToolChoice = fmt.Sprint(request.ToolChoice)
-	summary.MaxTokens = request.MaxTokens
-	summary.MaxCompletionTokens = request.MaxCompletionTokens
-	summary.Temperature = request.Temperature
-	if summary.ToolChoice == "<nil>" {
-		summary.ToolChoice = ""
+	var decoded struct {
+		Model               string            `json:"model"`
+		Messages            []json.RawMessage `json:"messages"`
+		Tools               []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+		ToolChoice          json.RawMessage `json:"tool_choice"`
+		MaxTokens           *int            `json:"max_tokens"`
+		MaxCompletionTokens *int            `json:"max_completion_tokens"`
+		Temperature         *float64        `json:"temperature"`
+	}
+	if len(jsonData) > 0 {
+		_ = json.Unmarshal(jsonData, &decoded)
 	}
 
-	if len(request.Messages) > 0 {
-		summary.Messages = make([]openAIMessageDebugSummary, 0, len(request.Messages))
-		for _, message := range request.Messages {
+	summary.Model = decoded.Model
+	summary.MessageCount = len(decoded.Messages)
+	summary.ToolCount = len(decoded.Tools)
+	summary.MaxTokens = decoded.MaxTokens
+	summary.MaxCompletionTokens = decoded.MaxCompletionTokens
+	summary.Temperature = decoded.Temperature
+
+	if len(decoded.ToolChoice) > 0 {
+		var asString string
+		if err := json.Unmarshal(decoded.ToolChoice, &asString); err == nil {
+			summary.ToolChoice = asString
+		} else {
+			summary.ToolChoice = strings.TrimSpace(string(decoded.ToolChoice))
+		}
+	}
+
+	if len(decoded.Messages) > 0 {
+		summary.Messages = make([]openAIMessageDebugSummary, 0, len(decoded.Messages))
+		for _, raw := range decoded.Messages {
+			var msg struct {
+				Role         string            `json:"role"`
+				Content      json.RawMessage   `json:"content"`
+				ToolCalls    []json.RawMessage `json:"tool_calls"`
+				FunctionCall json.RawMessage   `json:"function_call"`
+				ToolCallID   string            `json:"tool_call_id"`
+			}
+			_ = json.Unmarshal(raw, &msg)
+
+			contentBytes := 0
+			if len(msg.Content) > 0 {
+				var asString string
+				if err := json.Unmarshal(msg.Content, &asString); err == nil {
+					contentBytes = len(asString)
+				} else {
+					contentBytes = len(msg.Content)
+				}
+			}
+
 			summary.Messages = append(summary.Messages, openAIMessageDebugSummary{
-				Role:            message.Role,
-				ContentBytes:    len(message.Content),
-				ToolCalls:       len(message.ToolCalls),
-				HasFunctionCall: message.FunctionCall != nil,
-				HasToolCallID:   strings.TrimSpace(message.ToolCallID) != "",
+				Role:            msg.Role,
+				ContentBytes:    contentBytes,
+				ToolCalls:       len(msg.ToolCalls),
+				HasFunctionCall: len(msg.FunctionCall) > 0 && string(msg.FunctionCall) != "null",
+				HasToolCallID:   strings.TrimSpace(msg.ToolCallID) != "",
 			})
 		}
 	}
 
-	if len(request.Tools) > 0 {
-		summary.ToolNames = make([]string, 0, len(request.Tools))
-		for _, tool := range request.Tools {
+	if len(decoded.Tools) > 0 {
+		summary.ToolNames = make([]string, 0, len(decoded.Tools))
+		for _, tool := range decoded.Tools {
 			name := strings.TrimSpace(tool.Function.Name)
 			if name == "" {
 				name = "<unnamed>"
@@ -926,7 +1185,7 @@ func summarizeOpenAIRequest(request *openai.ChatCompletionRequest, jsonData []by
 	return summary
 }
 
-func writeOpenAIInvalidRequestDebug(request *openai.ChatCompletionRequest, jsonData []byte, responseStatus int, responseBody []byte) (string, error) {
+func writeOpenAIInvalidRequestDebug(params *openaisdk.ChatCompletionNewParams, jsonData []byte, responseStatus int, responseBody []byte) (string, error) {
 	file, err := os.CreateTemp(os.TempDir(), "dspy-openai-invalid-request-*.json")
 	if err != nil {
 		return "", err
@@ -934,7 +1193,7 @@ func writeOpenAIInvalidRequestDebug(request *openai.ChatCompletionRequest, jsonD
 	defer file.Close()
 
 	dump := openAIInvalidRequestDebugDump{
-		Summary:        summarizeOpenAIRequest(request, jsonData),
+		Summary:        summarizeOpenAIParams(params, jsonData),
 		RequestBody:    json.RawMessage(append([]byte(nil), jsonData...)),
 		ResponseStatus: responseStatus,
 		ResponseBody:   string(responseBody),
@@ -948,218 +1207,4 @@ func writeOpenAIInvalidRequestDebug(request *openai.ChatCompletionRequest, jsonD
 		return "", err
 	}
 	return file.Name(), nil
-}
-
-// makeRequest sends a chat completion request to the OpenAI API.
-func (o *OpenAILLM) makeRequest(ctx context.Context, request *openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
-	return o.makeRequestWithRetry(ctx, request, true)
-}
-
-func (o *OpenAILLM) makeRequestWithRetry(ctx context.Context, request *openai.ChatCompletionRequest, allowRetry bool) (*openai.ChatCompletionResponse, error) {
-	logger := logging.GetLogger()
-	jsonData, err := json.Marshal(request)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.InvalidInput, "failed to marshal request")
-	}
-
-	endpoint := o.GetEndpointConfig()
-	url := endpoint.BaseURL + endpoint.Path
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, errors.Wrap(err, errors.Unknown, "failed to create request")
-	}
-	if !allowRetry {
-		req.Close = true
-		req.Header.Set("Connection", "close")
-	}
-
-	// Set headers
-	for key, value := range endpoint.Headers {
-		req.Header.Set(key, value)
-	}
-
-	resp, err := o.GetHTTPClient().Do(req)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.LLMGenerationFailed, "request failed")
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.LLMGenerationFailed, "failed to read response")
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		var errorResp openai.ErrorResponse
-		if err := json.Unmarshal(body, &errorResp); err != nil {
-			return nil, errors.WithFields(
-				errors.New(errors.LLMGenerationFailed, "API request failed"),
-				errors.Fields{"status": resp.StatusCode, "body": string(body)})
-		}
-		fields := errors.Fields{
-			"type": errorResp.Error.Type,
-			"code": errorResp.Error.Code,
-		}
-		if errorResp.Error.Type == "invalid_request_error" {
-			summary := summarizeOpenAIRequest(request, jsonData)
-			dumpPath, dumpErr := writeOpenAIInvalidRequestDebug(request, jsonData, resp.StatusCode, body)
-			logger.Error(
-				ctx,
-				"OpenAI invalid request: model=%s body_bytes=%d messages=%d tools=%d tool_choice=%s max_tokens=%v max_completion_tokens=%v dump=%s response=%s",
-				summary.Model,
-				summary.BodyBytes,
-				summary.MessageCount,
-				summary.ToolCount,
-				summary.ToolChoice,
-				summary.MaxTokens,
-				summary.MaxCompletionTokens,
-				dumpPath,
-				strings.TrimSpace(errorResp.Error.Message),
-			)
-			fields["request_body_bytes"] = summary.BodyBytes
-			fields["request_body_sha256"] = summary.BodySHA256
-			fields["message_count"] = summary.MessageCount
-			fields["tool_count"] = summary.ToolCount
-			fields["tool_choice"] = summary.ToolChoice
-			if dumpPath != "" {
-				fields["debug_dump"] = dumpPath
-			}
-			if dumpErr != nil {
-				fields["debug_dump_error"] = dumpErr.Error()
-			}
-			if allowRetry && shouldRetryOpenAIInvalidJSON(errorResp.Error) {
-				logger.Warn(
-					ctx,
-					"Retrying OpenAI request after transient invalid_request_error with a fresh connection: model=%s dump=%s",
-					summary.Model,
-					dumpPath,
-				)
-				return o.makeRequestWithRetry(ctx, request, false)
-			}
-		}
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, errorResp.Error.Message),
-			fields)
-	}
-
-	var response openai.ChatCompletionResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, errors.Wrap(err, errors.InvalidResponse, "failed to parse response")
-	}
-
-	return &response, nil
-}
-
-func shouldRetryOpenAIInvalidJSON(apiError openai.APIError) bool {
-	if apiError.Type != "invalid_request_error" {
-		return false
-	}
-	message := strings.ToLower(strings.TrimSpace(apiError.Message))
-	return strings.Contains(message, "parse the json body")
-}
-
-// makeEmbeddingRequest sends an embedding request to the OpenAI API.
-func (o *OpenAILLM) makeEmbeddingRequest(ctx context.Context, request *openai.EmbeddingRequest) (*openai.EmbeddingResponse, error) {
-	jsonData, err := json.Marshal(request)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.InvalidInput, "failed to marshal request")
-	}
-
-	endpoint := o.GetEndpointConfig()
-	url := endpoint.BaseURL + "/v1/embeddings"
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, errors.Wrap(err, errors.Unknown, "failed to create request")
-	}
-
-	// Set headers
-	for key, value := range endpoint.Headers {
-		req.Header.Set(key, value)
-	}
-
-	resp, err := o.GetHTTPClient().Do(req)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.LLMGenerationFailed, "request failed")
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.LLMGenerationFailed, "failed to read response")
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		var errorResp openai.ErrorResponse
-		if err := json.Unmarshal(body, &errorResp); err != nil {
-			return nil, errors.WithFields(
-				errors.New(errors.LLMGenerationFailed, "API request failed"),
-				errors.Fields{"status": resp.StatusCode, "body": string(body)})
-		}
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, errorResp.Error.Message),
-			errors.Fields{"type": errorResp.Error.Type, "code": errorResp.Error.Code})
-	}
-
-	var response openai.EmbeddingResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, errors.Wrap(err, errors.InvalidResponse, "failed to parse response")
-	}
-
-	return &response, nil
-}
-
-// makeStreamingRequest sends a streaming chat completion request to the OpenAI API.
-func (o *OpenAILLM) makeStreamingRequest(ctx context.Context, request *openai.ChatCompletionRequest) (*http.Response, error) {
-	jsonData, err := json.Marshal(request)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.InvalidInput, "failed to marshal request")
-	}
-
-	endpoint := o.GetEndpointConfig()
-	url := endpoint.BaseURL + endpoint.Path
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, errors.Wrap(err, errors.Unknown, "failed to create request")
-	}
-
-	// Set headers
-	for key, value := range endpoint.Headers {
-		req.Header.Set(key, value)
-	}
-
-	resp, err := o.GetHTTPClient().Do(req)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.LLMGenerationFailed, "request failed")
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		var errorResp openai.ErrorResponse
-		if err := json.Unmarshal(body, &errorResp); err != nil {
-			return nil, errors.WithFields(
-				errors.New(errors.LLMGenerationFailed, "API request failed"),
-				errors.Fields{"status": resp.StatusCode, "body": string(body)})
-		}
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, errorResp.Error.Message),
-			errors.Fields{"type": errorResp.Error.Type, "code": errorResp.Error.Code})
-	}
-
-	return resp, nil
-}
-
-// coreOptsToOpenAI converts core.GenerateOptions to openai.GenerateOptions.
-func coreOptsToOpenAI(opts *core.GenerateOptions) *openai.GenerateOptions {
-	return openai.NewGenerateOptions(
-		opts.MaxTokens,
-		opts.Temperature,
-		opts.TopP,
-		opts.PresencePenalty,
-		opts.FrequencyPenalty,
-		opts.Stop,
-	)
 }
