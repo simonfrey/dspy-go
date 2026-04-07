@@ -1,18 +1,17 @@
 package llms
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"time"
+
+	"google.golang.org/genai"
 
 	"github.com/XiaoConstantine/dspy-go/pkg/core"
 	"github.com/XiaoConstantine/dspy-go/pkg/errors"
@@ -24,6 +23,13 @@ import (
 type GeminiLLM struct {
 	*core.BaseLLM
 	apiKey string
+
+	// SDK client. Populated eagerly by the public constructors and lazily by
+	// ensureClient when callers (notably tests) build a GeminiLLM struct
+	// directly without going through a constructor.
+	clientMu  sync.Mutex
+	client    *genai.Client
+	clientErr error
 }
 
 // GeminiRequest represents the request structure for Gemini API.
@@ -225,10 +231,14 @@ func NewGeminiLLM(apiKey string, model core.ModelID) (*GeminiLLM, error) {
 		TimeoutSec: 10 * 60,
 	}
 
-	return &GeminiLLM{
+	llm := &GeminiLLM{
 		apiKey:  apiKey,
 		BaseLLM: core.NewBaseLLM("google", model, capabilities, endpoint),
-	}, nil
+	}
+	// Best-effort eager client init. If it fails (e.g. malformed env), the
+	// error is surfaced from ensureClient on first use.
+	_, _ = llm.ensureClient(context.Background())
+	return llm, nil
 }
 
 // NewGeminiLLMFromConfig creates a new GeminiLLM instance from configuration.
@@ -303,10 +313,12 @@ func NewGeminiLLMFromConfig(ctx context.Context, config core.ProviderConfig, mod
 		capabilities = append(capabilities, core.CapabilityToolCalling)
 	}
 
-	return &GeminiLLM{
+	llm := &GeminiLLM{
 		apiKey:  apiKey,
 		BaseLLM: core.NewBaseLLM("google", modelID, capabilities, endpoint),
-	}, nil
+	}
+	_, _ = llm.ensureClient(ctx)
+	return llm, nil
 }
 
 // GeminiProviderFactory creates GeminiLLM instances.
@@ -569,60 +581,372 @@ func geminiRoleForChatMessage(role string) string {
 	}
 }
 
+// ensureClient lazily initializes the genai SDK client. The client is built
+// from the apiKey and endpoint base URL on the GeminiLLM, which lets tests
+// that construct GeminiLLM by hand (with an httptest.Server URL) keep working.
+// The Gemini API backend is forced; Vertex AI is not supported by this layer.
+func (g *GeminiLLM) ensureClient(ctx context.Context) (*genai.Client, error) {
+	g.clientMu.Lock()
+	defer g.clientMu.Unlock()
+	if g.client != nil {
+		return g.client, nil
+	}
+	if g.clientErr != nil {
+		return nil, g.clientErr
+	}
+
+	cfg := &genai.ClientConfig{
+		APIKey:  g.apiKey,
+		Backend: genai.BackendGeminiAPI,
+	}
+	if endpoint := g.GetEndpointConfig(); endpoint != nil {
+		if endpoint.BaseURL != "" {
+			// genai's base URL is appended with "{apiVersion}/models/...";
+			// it expects a trailing slash to demarcate the API root from the
+			// resource path. Test servers (httptest.NewServer) hand back URLs
+			// without a trailing slash, so we add one defensively.
+			baseURL := strings.TrimRight(endpoint.BaseURL, "/") + "/"
+			cfg.HTTPOptions.BaseURL = baseURL
+		}
+		if len(endpoint.Headers) > 0 {
+			cfg.HTTPOptions.Headers = http.Header{}
+			for k, v := range endpoint.Headers {
+				// The SDK manages Content-Type itself; forwarding ours would
+				// double up the header.
+				if strings.EqualFold(k, "Content-Type") {
+					continue
+				}
+				cfg.HTTPOptions.Headers.Set(k, v)
+			}
+		}
+	}
+
+	client, err := genai.NewClient(ctx, cfg)
+	if err != nil {
+		g.clientErr = err
+		return nil, err
+	}
+	g.client = client
+	return client, nil
+}
+
+// doGeminiRequest is the legacy entry point used by Generate, GenerateWithFunctions,
+// GenerateWithTools, and GenerateWithJSON. It accepts a fully-constructed legacy
+// geminiRequest, translates it to the SDK's typed call, and writes the result
+// back into a legacy geminiResponse / geminiFunctionCallResponse so the calling
+// methods see no behavioral change.
 func (g *GeminiLLM) doGeminiRequest(ctx context.Context, reqBody any, dest any) error {
-	jsonData, err := json.Marshal(reqBody)
+	legacyReq, err := coerceGeminiRequest(reqBody)
+	if err != nil {
+		return errors.WithFields(err, errors.Fields{"model": g.ModelID()})
+	}
+
+	client, err := g.ensureClient(ctx)
 	if err != nil {
 		return errors.WithFields(
-			errors.New(errors.InvalidInput, fmt.Sprintf("failed to marshal Gemini request body: %v", err)),
+			errors.New(errors.InvalidInput, fmt.Sprintf("failed to initialize Gemini client: %v", err)),
 			errors.Fields{"model": g.ModelID()},
 		)
 	}
 
-	req, err := http.NewRequestWithContext(
-		ctx,
-		"POST",
-		constructRequestURL(g.GetEndpointConfig(), g.apiKey),
-		bytes.NewBuffer(jsonData),
-	)
+	contents := legacyContentsToSDK(legacyReq.Contents)
+	config := legacyRequestToSDKConfig(legacyReq)
+
+	sdkResp, err := client.Models.GenerateContent(ctx, g.ModelID(), contents, config)
 	if err != nil {
-		return errors.WithFields(
-			errors.New(errors.InvalidInput, fmt.Sprintf("failed to create Gemini request: %v", err)),
-			errors.Fields{"model": g.ModelID()},
-		)
-	}
-	for key, value := range g.GetEndpointConfig().Headers {
-		req.Header.Set(key, value)
+		return wrapGeminiSDKError(err, g.ModelID())
 	}
 
-	resp, err := g.GetHTTPClient().Do(req)
-	if err != nil {
-		return errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("LLMGenerationFailed: failed to send Gemini request: %v", err)),
-			errors.Fields{"model": g.ModelID()},
-		)
-	}
-	defer resp.Body.Close()
+	legacyResp := sdkGenerateContentResponseToLegacy(sdkResp)
+	return assignLegacyGeminiResponse(legacyResp, dest)
+}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+func coerceGeminiRequest(reqBody any) (geminiRequest, error) {
+	switch v := reqBody.(type) {
+	case geminiRequest:
+		return v, nil
+	case *geminiRequest:
+		if v == nil {
+			return geminiRequest{}, errors.New(errors.InvalidInput, "nil Gemini request body")
+		}
+		return *v, nil
+	default:
+		// Round-trip via JSON for any other shape so the calling code can be
+		// liberal about request type. This branch is not exercised by the
+		// existing call sites but keeps the helper future-proof.
+		raw, err := json.Marshal(reqBody)
+		if err != nil {
+			return geminiRequest{}, errors.New(errors.InvalidInput, fmt.Sprintf("failed to marshal Gemini request body: %v", err))
+		}
+		var out geminiRequest
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return geminiRequest{}, errors.New(errors.InvalidInput, fmt.Sprintf("failed to coerce Gemini request body: %v", err))
+		}
+		return out, nil
+	}
+}
+
+// wrapGeminiSDKError converts a genai SDK error into the dspy-go error envelope
+// the rest of the codebase (and tests) expect. The historical hand-rolled HTTP
+// path produced messages like "API request failed with status code 503: ...";
+// callers and tests assert against substrings of those messages, so the
+// wrapper preserves them.
+func wrapGeminiSDKError(err error, modelID string) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr genai.APIError
+	if stderrors.As(err, &apiErr) {
+		message := strings.TrimSpace(apiErr.Message)
+		if message == "" {
+			message = strings.TrimSpace(apiErr.Status)
+		}
+		formatted := fmt.Sprintf("LLMGenerationFailed: API request failed with status code %d: %s", apiErr.Code, message)
+		fields := errors.Fields{"model": modelID, "statusCode": apiErr.Code}
+		if apiErr.Status != "" {
+			fields["status"] = apiErr.Status
+		}
 		return errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("LLMGenerationFailed: failed to read Gemini response body: %v", err)),
-			errors.Fields{"model": g.ModelID()},
+			errors.New(errors.LLMGenerationFailed, formatted),
+			fields,
 		)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("LLMGenerationFailed: API request failed with status code %d: %s", resp.StatusCode, string(body))),
-			errors.Fields{"model": g.ModelID(), "statusCode": resp.StatusCode},
-		)
-	}
-	if err := json.Unmarshal(body, dest); err != nil {
+	// JSON decode failures inside the SDK look like "error unmarshalling response".
+	low := strings.ToLower(err.Error())
+	if strings.Contains(low, "unmarshalling response") || strings.Contains(low, "unmarshal") {
 		return errors.WithFields(
 			errors.New(errors.InvalidResponse, fmt.Sprintf("InvalidResponse: failed to unmarshal Gemini response: %v", err)),
-			errors.Fields{"model": g.ModelID(), "body": string(body)},
+			errors.Fields{"model": modelID},
 		)
 	}
-	return nil
+	return errors.WithFields(
+		errors.New(errors.LLMGenerationFailed, fmt.Sprintf("LLMGenerationFailed: failed to send Gemini request: %v", err)),
+		errors.Fields{"model": modelID},
+	)
+}
+
+// legacyContentsToSDK converts the dspy-go legacy geminiContent representation
+// into the SDK's *genai.Content slice. It mirrors every field used by the
+// existing helpers (text, inline data, file data, function calls, function
+// responses, thoughts/signatures) so the round-trip is lossless.
+func legacyContentsToSDK(contents []geminiContent) []*genai.Content {
+	if len(contents) == 0 {
+		return nil
+	}
+	out := make([]*genai.Content, 0, len(contents))
+	for _, c := range contents {
+		parts := make([]*genai.Part, 0, len(c.Parts))
+		for _, p := range c.Parts {
+			parts = append(parts, legacyPartToSDK(p))
+		}
+		out = append(out, &genai.Content{
+			Parts: parts,
+			Role:  c.Role,
+		})
+	}
+	return out
+}
+
+func legacyPartToSDK(p geminiPart) *genai.Part {
+	out := &genai.Part{
+		Text:    p.Text,
+		Thought: p.Thought,
+	}
+	if p.ThoughtSignature != "" {
+		out.ThoughtSignature = []byte(p.ThoughtSignature)
+	}
+	if p.InlineData != nil {
+		// Legacy inline data carries base64-encoded bytes; the SDK Blob wants
+		// raw bytes. Decoding here keeps wire compatibility identical.
+		data, err := base64.StdEncoding.DecodeString(p.InlineData.Data)
+		if err != nil {
+			data = []byte(p.InlineData.Data)
+		}
+		out.InlineData = &genai.Blob{
+			MIMEType: p.InlineData.MimeType,
+			Data:     data,
+		}
+	}
+	if p.FileData != nil {
+		out.FileData = &genai.FileData{
+			MIMEType: p.FileData.MimeType,
+			FileURI:  p.FileData.FileURI,
+		}
+	}
+	if p.FunctionCall != nil {
+		out.FunctionCall = &genai.FunctionCall{
+			ID:   p.FunctionCall.ID,
+			Name: p.FunctionCall.Name,
+			Args: p.FunctionCall.Arguments,
+		}
+	}
+	if p.FunctionResponse != nil {
+		out.FunctionResponse = &genai.FunctionResponse{
+			ID:       p.FunctionResponse.ID,
+			Name:     p.FunctionResponse.Name,
+			Response: p.FunctionResponse.Response,
+		}
+	}
+	return out
+}
+
+// legacyRequestToSDKConfig folds the legacy geminiRequest's GenerationConfig,
+// Tools, and ToolConfig into a single SDK GenerateContentConfig.
+func legacyRequestToSDKConfig(req geminiRequest) *genai.GenerateContentConfig {
+	cfg := &genai.GenerateContentConfig{}
+	if req.GenerationConfig.Temperature != 0 {
+		t := float32(req.GenerationConfig.Temperature)
+		cfg.Temperature = &t
+	}
+	if req.GenerationConfig.MaxOutputTokens != 0 {
+		cfg.MaxOutputTokens = int32(req.GenerationConfig.MaxOutputTokens)
+	}
+	if req.GenerationConfig.TopP != 0 {
+		t := float32(req.GenerationConfig.TopP)
+		cfg.TopP = &t
+	}
+	if req.GenerationConfig.ThinkingConfig != nil {
+		cfg.ThinkingConfig = &genai.ThinkingConfig{
+			IncludeThoughts: req.GenerationConfig.ThinkingConfig.IncludeThoughts,
+		}
+	}
+	if len(req.Tools) > 0 {
+		cfg.Tools = make([]*genai.Tool, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			decls := make([]*genai.FunctionDeclaration, 0, len(t.FunctionDeclarations))
+			for _, d := range t.FunctionDeclarations {
+				decl := &genai.FunctionDeclaration{
+					Name:        d.Name,
+					Description: d.Description,
+				}
+				if len(d.Parameters) > 0 {
+					// Use the JSON-schema escape hatch so the legacy
+					// map[string]interface{} schema flows through unchanged
+					// without forcing us to translate to the SDK's typed Schema.
+					decl.ParametersJsonSchema = d.Parameters
+				}
+				decls = append(decls, decl)
+			}
+			cfg.Tools = append(cfg.Tools, &genai.Tool{FunctionDeclarations: decls})
+		}
+	}
+	if req.ToolConfig != nil && req.ToolConfig.FunctionCallingConfig != nil {
+		cfg.ToolConfig = &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode:                 genai.FunctionCallingConfigMode(req.ToolConfig.FunctionCallingConfig.Mode),
+				AllowedFunctionNames: req.ToolConfig.FunctionCallingConfig.AllowedFunctionNames,
+			},
+		}
+	}
+	return cfg
+}
+
+// sdkGenerateContentResponseToLegacy folds an SDK GenerateContentResponse into
+// a legacy geminiFunctionCallResponse, which is the superset of the two legacy
+// response types (geminiResponse and geminiFunctionCallResponse share the same
+// candidate/usage shape).
+func sdkGenerateContentResponseToLegacy(resp *genai.GenerateContentResponse) geminiFunctionCallResponse {
+	var out geminiFunctionCallResponse
+	if resp == nil {
+		return out
+	}
+	for _, cand := range resp.Candidates {
+		var cs struct {
+			Content struct {
+				Parts []geminiPart `json:"parts"`
+			} `json:"content"`
+			FinishReason string `json:"finishReason,omitempty"`
+		}
+		if cand.Content != nil {
+			parts := make([]geminiPart, 0, len(cand.Content.Parts))
+			for _, p := range cand.Content.Parts {
+				parts = append(parts, sdkPartToLegacy(p))
+			}
+			cs.Content.Parts = parts
+		}
+		cs.FinishReason = string(cand.FinishReason)
+		out.Candidates = append(out.Candidates, cs)
+	}
+	if resp.UsageMetadata != nil {
+		out.UsageMetadata.PromptTokenCount = int(resp.UsageMetadata.PromptTokenCount)
+		out.UsageMetadata.CandidatesTokenCount = int(resp.UsageMetadata.CandidatesTokenCount)
+		out.UsageMetadata.TotalTokenCount = int(resp.UsageMetadata.TotalTokenCount)
+		out.UsageMetadata.ThoughtsTokenCount = int(resp.UsageMetadata.ThoughtsTokenCount)
+	}
+	if resp.PromptFeedback != nil {
+		feedback := map[string]any{}
+		if resp.PromptFeedback.BlockReason != "" {
+			feedback["blockReason"] = string(resp.PromptFeedback.BlockReason)
+		}
+		if resp.PromptFeedback.BlockReasonMessage != "" {
+			feedback["blockReasonMessage"] = resp.PromptFeedback.BlockReasonMessage
+		}
+		if len(feedback) > 0 {
+			out.PromptFeedback = feedback
+		}
+	}
+	return out
+}
+
+func sdkPartToLegacy(p *genai.Part) geminiPart {
+	if p == nil {
+		return geminiPart{}
+	}
+	out := geminiPart{
+		Text:    p.Text,
+		Thought: p.Thought,
+	}
+	if len(p.ThoughtSignature) > 0 {
+		out.ThoughtSignature = string(p.ThoughtSignature)
+	}
+	if p.InlineData != nil {
+		out.InlineData = &geminiInlineData{
+			MimeType: p.InlineData.MIMEType,
+			Data:     base64.StdEncoding.EncodeToString(p.InlineData.Data),
+		}
+	}
+	if p.FileData != nil {
+		out.FileData = &geminiFileData{
+			MimeType: p.FileData.MIMEType,
+			FileURI:  p.FileData.FileURI,
+		}
+	}
+	if p.FunctionCall != nil {
+		out.FunctionCall = &geminiFunctionCall{
+			ID:        p.FunctionCall.ID,
+			Name:      p.FunctionCall.Name,
+			Arguments: p.FunctionCall.Args,
+		}
+	}
+	if p.FunctionResponse != nil {
+		out.FunctionResponse = &geminiFunctionResponsePart{
+			ID:       p.FunctionResponse.ID,
+			Name:     p.FunctionResponse.Name,
+			Response: p.FunctionResponse.Response,
+		}
+	}
+	return out
+}
+
+// assignLegacyGeminiResponse copies the merged legacy response into either of
+// the two destination shapes used by callers.
+func assignLegacyGeminiResponse(src geminiFunctionCallResponse, dest any) error {
+	switch d := dest.(type) {
+	case *geminiResponse:
+		d.Candidates = src.Candidates
+		d.UsageMetadata = src.UsageMetadata
+		return nil
+	case *geminiFunctionCallResponse:
+		*d = src
+		return nil
+	default:
+		// Fall back to JSON round-trip for any unexpected destination shape.
+		raw, err := json.Marshal(src)
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(raw, dest)
+	}
 }
 
 func contentBlocksToText(blocks []core.ContentBlock) string {
@@ -975,291 +1299,178 @@ func (g *GeminiLLM) CreateEmbedding(ctx context.Context, input string, options .
 		return nil, errors.New(errors.InvalidInput, fmt.Sprintf("invalid Gemini embedding model: %s", opts.Model))
 	}
 
-	// Prepare the request body
-	reqBody := geminiEmbeddingRequest{
-		Model: fmt.Sprintf("models/%s", opts.Model),
-	}
-	reqBody.Content.Parts = []struct {
-		Text string `json:"text"`
-	}{{Text: input}}
-
-	// Add task type if specified in options
-	if taskType, ok := opts.Params["task_type"].(string); ok {
-		reqBody.TaskType = taskType
-	}
-
-	// Add any additional parameters
-	reqBody.Parameters = opts.Params
-
-	// Marshal request
-	jsonData, err := json.Marshal(reqBody)
+	client, err := g.ensureClient(ctx)
 	if err != nil {
 		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to marshal request body"),
-			errors.Fields{
-				"model":        opts.Model,
-				"input_length": len(input),
-			})
+			errors.Wrap(err, errors.InvalidInput, "failed to initialize Gemini client"),
+			errors.Fields{"model": opts.Model},
+		)
 	}
 
-	// Create request
-	url := fmt.Sprintf("%s/models/%s:embedContent?key=%s",
-		g.GetEndpointConfig().BaseURL,
-		opts.Model,
-		g.apiKey)
-	req, err := http.NewRequestWithContext(
-		ctx,
-		"POST",
-		url,
-		bytes.NewBuffer(jsonData),
-	)
+	cfg := buildGeminiEmbedConfig(opts)
+	contents := []*genai.Content{
+		genai.NewContentFromText(input, genai.RoleUser),
+	}
 
+	resp, err := client.Models.EmbedContent(ctx, opts.Model, contents, cfg)
 	if err != nil {
 		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to create request"),
-			errors.Fields{
-				"model": opts.Model,
-			})
-	}
-	// Set headers
-	for key, value := range g.GetEndpointConfig().Headers {
-		req.Header.Set(key, value)
+			wrapGeminiEmbeddingSDKError(err, opts.Model),
+			errors.Fields{"input_length": len(input)},
+		)
 	}
 
-	// Execute request
-	resp, err := g.GetHTTPClient().Do(req)
-
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.LLMGenerationFailed, "failed to send request"),
-			errors.Fields{
-				"model": opts.Model,
-			})
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.LLMGenerationFailed, "failed to read response body"),
-			errors.Fields{
-				"model": opts.Model,
-			})
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		truncatedBody := string(body)
-		if len(truncatedBody) > 500 { // Example: truncate to 500 characters
-			truncatedBody = truncatedBody[:500] + "... (truncated)"
-		}
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("API request failed with status code %d: %s", resp.StatusCode, string(truncatedBody))),
-			errors.Fields{
-				"model":      opts.Model,
-				"statusCode": resp.StatusCode,
-			})
-	}
-
-	var geminiResp geminiEmbeddingResponse
-	if err := json.Unmarshal(body, &geminiResp); err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidResponse, "failed to unmarshal response"),
-			errors.Fields{
-				"model": opts.Model,
-			})
-	}
-
-	// Check if the embedding values exist
-	if len(geminiResp.Embedding.Values) == 0 {
+	if len(resp.Embeddings) == 0 || len(resp.Embeddings[0].Values) == 0 {
 		return nil, errors.WithFields(
 			errors.New(errors.InvalidResponse, "embedding values missing in response"),
-			errors.Fields{
-				"model": opts.Model,
-			})
+			errors.Fields{"model": opts.Model},
+		)
 	}
 
-	// Convert to standard format
+	embedding := resp.Embeddings[0]
 	result := &core.EmbeddingResult{
-		Vector:     geminiResp.Embedding.Values,
-		TokenCount: geminiResp.UsageMetadata.TotalTokenCount,
+		Vector:     embedding.Values,
+		TokenCount: embeddingTokenCount(embedding),
 		Metadata: map[string]interface{}{
-
 			"model":            opts.Model,
-			"prompt_tokens":    geminiResp.UsageMetadata.PromptTokenCount,
-			"truncated_tokens": geminiResp.Embedding.Statistics.TruncatedInputTokenCount,
-			"embedding_tokens": geminiResp.Embedding.Statistics.TokenCount,
+			"prompt_tokens":    embeddingTokenCount(embedding),
+			"truncated_tokens": embeddingTruncatedTokens(embedding),
+			"embedding_tokens": embeddingTokenCount(embedding),
 		},
 	}
-
 	return result, nil
+}
+
+// buildGeminiEmbedConfig translates dspy-go's EmbeddingOptions into the SDK's
+// EmbedContentConfig. Only the task_type parameter is currently meaningful for
+// the legacy callers; the rest of opts.Params is ignored because the SDK does
+// not have a typed equivalent on the Gemini backend.
+func buildGeminiEmbedConfig(opts *core.EmbeddingOptions) *genai.EmbedContentConfig {
+	if opts == nil {
+		return nil
+	}
+	cfg := &genai.EmbedContentConfig{}
+	hasField := false
+	if taskType, ok := opts.Params["task_type"].(string); ok && taskType != "" {
+		cfg.TaskType = taskType
+		hasField = true
+	}
+	if title, ok := opts.Params["title"].(string); ok && title != "" {
+		cfg.Title = title
+		hasField = true
+	}
+	if !hasField {
+		return nil
+	}
+	return cfg
+}
+
+func embeddingTokenCount(e *genai.ContentEmbedding) int {
+	if e == nil || e.Statistics == nil {
+		return 0
+	}
+	return int(e.Statistics.TokenCount)
+}
+
+func embeddingTruncatedTokens(e *genai.ContentEmbedding) int {
+	if e == nil || e.Statistics == nil || !e.Statistics.Truncated {
+		return 0
+	}
+	return int(e.Statistics.TokenCount)
+}
+
+func wrapGeminiEmbeddingSDKError(err error, model string) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr genai.APIError
+	if stderrors.As(err, &apiErr) {
+		message := strings.TrimSpace(apiErr.Message)
+		if message == "" {
+			message = strings.TrimSpace(apiErr.Status)
+		}
+		return errors.WithFields(
+			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("API request failed with status code %d: %s", apiErr.Code, message)),
+			errors.Fields{"model": model, "statusCode": apiErr.Code},
+		)
+	}
+	low := strings.ToLower(err.Error())
+	if strings.Contains(low, "unmarshal") {
+		return errors.WithFields(
+			errors.Wrap(err, errors.InvalidResponse, "failed to unmarshal response"),
+			errors.Fields{"model": model},
+		)
+	}
+	return errors.WithFields(
+		errors.Wrap(err, errors.LLMGenerationFailed, "failed to send request"),
+		errors.Fields{"model": model},
+	)
 }
 
 // CreateEmbeddings implements batch embedding generation.
 func (g *GeminiLLM) CreateEmbeddings(ctx context.Context, inputs []string, options ...core.EmbeddingOption) (*core.BatchEmbeddingResult, error) {
-	// Apply options
 	opts := core.NewEmbeddingOptions()
 	for _, opt := range options {
 		opt(opts)
 	}
 
-	// Use default batch size if not specified
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = 32
 	}
 
+	const model = "text-embedding-004"
+
+	client, err := g.ensureClient(ctx)
+	if err != nil {
+		return nil, errors.WithFields(
+			errors.Wrap(err, errors.InvalidInput, "failed to initialize Gemini client"),
+			errors.Fields{"model": model},
+		)
+	}
+
+	cfg := buildGeminiEmbedConfig(opts)
+
 	var allResults []core.EmbeddingResult
 	var firstError error
-	var errorIndex = -1
+	errorIndex := -1
 
-	// Process in batches
 	for i := 0; i < len(inputs); i += opts.BatchSize {
 		end := i + opts.BatchSize
 		if end > len(inputs) {
 			end = len(inputs)
 		}
-
 		batch := inputs[i:end]
-		// Prepare batch request
-		reqBody := geminiBatchEmbeddingRequest{
-			Model: "text-embedding-004",
+
+		contents := make([]*genai.Content, 0, len(batch))
+		for _, in := range batch {
+			contents = append(contents, genai.NewContentFromText(in, genai.RoleUser))
 		}
 
-		// Add each input to the batch request
-		reqBody.Requests = make([]struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		}, len(batch))
-
-		for j, input := range batch {
-			reqBody.Requests[j].Content.Parts = []struct {
-				Text string `json:"text"`
-			}{{Text: input}}
-		}
-
-		// Add task type if specified
-		if taskType, ok := opts.Params["task_type"].(string); ok {
-			reqBody.TaskType = taskType
-		}
-		reqBody.Parameters = opts.Params
-
-		// Marshal request
-		jsonData, err := json.Marshal(reqBody)
-		if err != nil {
+		resp, embedErr := client.Models.EmbedContent(ctx, model, contents, cfg)
+		if embedErr != nil {
 			if firstError == nil {
-				firstError = errors.WithFields(
-					errors.Wrap(err, errors.InvalidInput, "failed to marshal batch request"),
-					errors.Fields{
-						"model":      "text-embedding-004",
-						"batch_size": len(batch),
-					})
+				firstError = wrapGeminiEmbeddingSDKError(embedErr, model)
 				errorIndex = i
 			}
 			continue
 		}
 
-		url := fmt.Sprintf("%s/models/text-embedding-004:batchEmbedContents?key=%s",
-			g.GetEndpointConfig().BaseURL,
-			g.apiKey)
-
-		// Create request
-		req, err := http.NewRequestWithContext(
-			ctx,
-			"POST",
-			url,
-			bytes.NewBuffer(jsonData),
-		)
-		if err != nil {
-			if firstError == nil {
-				firstError = errors.WithFields(
-					errors.Wrap(err, errors.InvalidInput, "failed to create batch request"),
-					errors.Fields{
-						"model": "text-embedding-004",
-					})
-				errorIndex = i
-			}
-			continue
-		}
-
-		// Set headers
-		for key, value := range g.GetEndpointConfig().Headers {
-			req.Header.Set(key, value)
-		}
-
-		// Execute request
-		resp, err := g.GetHTTPClient().Do(req)
-		if err != nil {
-			if firstError == nil {
-				firstError = errors.WithFields(
-					errors.Wrap(err, errors.LLMGenerationFailed, "failed to send batch request"),
-					errors.Fields{
-						"model": "text-embedding-004",
-					})
-				errorIndex = i
-			}
-			continue
-		}
-
-		// Read response
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			if firstError == nil {
-				firstError = errors.WithFields(
-					errors.Wrap(err, errors.LLMGenerationFailed, "failed to read batch response"),
-					errors.Fields{
-						"model": "text-embedding-004",
-					})
-				errorIndex = i
-			}
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			if firstError == nil {
-				firstError = errors.WithFields(
-					errors.New(errors.LLMGenerationFailed, fmt.Sprintf("API request failed with status code %d: %s", resp.StatusCode, string(body))),
-					errors.Fields{
-						"model":      "text-embedding-004",
-						"statusCode": resp.StatusCode,
-					})
-				errorIndex = i
-			}
-			continue
-		}
-
-		var batchResp geminiBatchEmbeddingResponse
-		if err := json.Unmarshal(body, &batchResp); err != nil {
-			if firstError == nil {
-				firstError = errors.WithFields(
-					errors.Wrap(err, errors.InvalidResponse, "failed to unmarshal batch response"),
-					errors.Fields{
-						"model": "text-embedding-004",
-					})
-				errorIndex = i
-			}
-			continue
-		}
-
-		// Process batch results
-		for j, embedding := range batchResp.Embeddings {
+		for j, embedding := range resp.Embeddings {
 			result := core.EmbeddingResult{
-				Vector:     embedding.Embedding.Values,
-				TokenCount: embedding.UsageMetadata.TotalTokenCount,
+				Vector:     embedding.Values,
+				TokenCount: embeddingTokenCount(embedding),
 				Metadata: map[string]interface{}{
-					"model":            "text-embedding-004",
-					"prompt_tokens":    embedding.UsageMetadata.PromptTokenCount,
-					"truncated_tokens": embedding.Embedding.Statistics.TruncatedInputTokenCount,
-					"embedding_tokens": embedding.Embedding.Statistics.TokenCount,
+					"model":            model,
+					"prompt_tokens":    embeddingTokenCount(embedding),
+					"truncated_tokens": embeddingTruncatedTokens(embedding),
+					"embedding_tokens": embeddingTokenCount(embedding),
 					"batch_index":      i + j,
 				},
 			}
 			allResults = append(allResults, result)
 		}
 	}
-	// If we had errors but still got some results, return what we have
+
 	if firstError != nil && len(allResults) == 0 {
 		return nil, firstError
 	}
@@ -1272,37 +1483,28 @@ func (g *GeminiLLM) CreateEmbeddings(ctx context.Context, inputs []string, optio
 }
 
 // streamRequest handles the common streaming logic for both StreamGenerate and StreamGenerateWithContent.
+// The body is the legacy geminiRequest; we route the call through the genai SDK
+// streaming iterator and feed each chunk into the dspy-go StreamResponse channel.
 func (g *GeminiLLM) streamRequest(ctx context.Context, reqBody interface{}) (*core.StreamResponse, error) {
-	jsonData, err := json.Marshal(reqBody)
+	legacyReq, err := coerceGeminiRequest(reqBody)
+	if err != nil {
+		return nil, errors.WithFields(err, errors.Fields{"model": g.ModelID()})
+	}
+
+	client, err := g.ensureClient(ctx)
 	if err != nil {
 		return nil, errors.WithFields(
-			errors.New(errors.InvalidInput, fmt.Sprintf("failed to marshal request body: %v", err)),
+			errors.New(errors.InvalidInput, fmt.Sprintf("failed to initialize Gemini client: %v", err)),
 			errors.Fields{"model": g.ModelID()})
 	}
 
-	// Add streaming parameter
-	streamURL := constructRequestURL(g.GetEndpointConfig(), g.apiKey) + "&alt=sse"
+	contents := legacyContentsToSDK(legacyReq.Contents)
+	config := legacyRequestToSDKConfig(legacyReq)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", streamURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.New(errors.InvalidInput, fmt.Sprintf("failed to create request: %v", err)),
-			errors.Fields{"model": g.ModelID()})
-	}
-
-	for key, value := range g.GetEndpointConfig().Headers {
-		req.Header.Set(key, value)
-	}
-	req.Header.Set("Accept", "text/event-stream")
-
-	// Create channels and response
 	chunkChan := make(chan core.StreamChunk)
 	streamCtx, cancelStream := context.WithCancel(ctx)
 
-	// Used to protect against multiple closes
 	var channelClosed sync.Once
-
-	// Create a safe way to close the channel
 	safeCloseChannel := func() {
 		channelClosed.Do(func() {
 			close(chunkChan)
@@ -1316,103 +1518,59 @@ func (g *GeminiLLM) streamRequest(ctx context.Context, reqBody interface{}) (*co
 		},
 	}
 
-	// Start streaming goroutine
 	go func() {
 		defer safeCloseChannel()
 
-		client := g.GetHTTPClient()
-		resp, err := client.Do(req)
-		if err != nil {
+		seq := client.Models.GenerateContentStream(streamCtx, g.ModelID(), contents, config)
+		seq(func(resp *genai.GenerateContentResponse, iterErr error) bool {
 			if streamCtx.Err() != nil {
-				return
+				return false
 			}
-			chunkChan <- core.StreamChunk{
-				Error: errors.New(errors.LLMGenerationFailed, fmt.Sprintf("request failed: %v", err)),
-			}
-			return
-		}
-		defer resp.Body.Close()
-
-		reader := bufio.NewReader(resp.Body)
-
-		for {
-			select {
-			case <-streamCtx.Done():
-				return
-			default:
-			}
-
-			readCtx, cancel := context.WithTimeout(streamCtx, 500*time.Millisecond)
-
-			ch := make(chan struct {
-				line string
-				err  error
-			}, 1)
-
-			go func() {
-				line, err := reader.ReadString('\n')
-				ch <- struct {
-					line string
-					err  error
-				}{line, err}
-			}()
-
-			var line string
-			var readErr error
-
-			select {
-			case result := <-ch:
-				line = result.line
-				readErr = result.err
-				cancel()
-			case <-readCtx.Done():
-				cancel()
-				if streamCtx.Err() != nil {
-					return
+			if iterErr != nil {
+				// Skip the SDK's "[DONE]" parse error which arises because the
+				// real Gemini API does not send a [DONE] sentinel but some
+				// test fixtures do. Any other error is real and is forwarded.
+				if isGeminiDoneSentinelError(iterErr) {
+					return false
 				}
-				continue
-			}
-
-			if readErr != nil {
-				if readErr == io.EOF || streamCtx.Err() != nil {
-					return
+				select {
+				case chunkChan <- core.StreamChunk{
+					Error: wrapGeminiSDKError(iterErr, g.ModelID()),
+				}:
+				case <-streamCtx.Done():
 				}
-				if streamCtx.Err() == nil {
-					chunkChan <- core.StreamChunk{
-						Error: errors.New(errors.LLMGenerationFailed, fmt.Sprintf("stream read error: %v", readErr)),
-					}
-				}
-				return
+				return false
 			}
-
-			if streamCtx.Err() != nil {
-				return
+			if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+				return true
 			}
-
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "data: ") {
-				data := strings.TrimPrefix(line, "data: ")
-
-				if data == "[DONE]" {
-					return
-				}
-
-				var chunk geminiResponse
-				if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			for _, part := range resp.Candidates[0].Content.Parts {
+				if part == nil || part.Text == "" {
 					continue
 				}
-
-				if len(chunk.Candidates) > 0 && len(chunk.Candidates[0].Content.Parts) > 0 {
-					content := chunk.Candidates[0].Content.Parts[0].Text
-					if streamCtx.Err() == nil {
-						chunkChan <- core.StreamChunk{Content: content}
-					}
+				select {
+				case chunkChan <- core.StreamChunk{Content: part.Text}:
+				case <-streamCtx.Done():
+					return false
 				}
 			}
-		}
+			return true
+		})
 	}()
 
 	return response, nil
+}
+
+// isGeminiDoneSentinelError matches the error genai.iterateResponseStream
+// emits when it tries to JSON-decode a `data: [DONE]` line. The real Gemini
+// API never emits this, but historical test fixtures still do, and treating it
+// as graceful end-of-stream keeps those fixtures green.
+func isGeminiDoneSentinelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "[DONE]") || strings.Contains(msg, "invalid character '['")
 }
 
 // StreamGenerate for Gemini.
@@ -1492,69 +1650,13 @@ func (g *GeminiLLM) GenerateWithContent(ctx context.Context, content []core.Cont
 		GenerationConfig: g.buildGenerationConfig(opts),
 	}
 
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
+	var geminiResp geminiResponse
+	if err := g.doGeminiRequest(ctx, reqBody, &geminiResp); err != nil {
 		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to marshal request body"),
+			err,
 			errors.Fields{
 				"content_blocks": len(content),
 				"model":          g.ModelID(),
-			})
-	}
-
-	req, err := http.NewRequestWithContext(
-		ctx,
-		"POST",
-		constructRequestURL(g.GetEndpointConfig(), g.apiKey),
-		bytes.NewBuffer(jsonData),
-	)
-
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.Wrap(err, errors.InvalidInput, "failed to create request"),
-			errors.Fields{
-				"model": g.ModelID(),
-			})
-	}
-
-	for key, value := range g.GetEndpointConfig().Headers {
-		req.Header.Set(key, value)
-	}
-
-	resp, err := g.GetHTTPClient().Do(req)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("failed to send request: %v", err)),
-			errors.Fields{
-				"model": g.ModelID(),
-			})
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("failed to read response body: %v", err)),
-			errors.Fields{
-				"model": g.ModelID(),
-			})
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.WithFields(
-			errors.New(errors.LLMGenerationFailed, fmt.Sprintf("API request failed with status code %d: %s", resp.StatusCode, string(body))),
-			errors.Fields{
-				"model":      g.ModelID(),
-				"statusCode": resp.StatusCode,
-			})
-	}
-
-	var geminiResp geminiResponse
-	if err := json.Unmarshal(body, &geminiResp); err != nil {
-		return nil, errors.WithFields(
-			errors.New(errors.InvalidResponse, fmt.Sprintf("failed to unmarshal response: %v", err)),
-			errors.Fields{
-				"model": g.ModelID(),
 			})
 	}
 

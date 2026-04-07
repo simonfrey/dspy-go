@@ -473,55 +473,28 @@ func TestGeminiLLM_Embeddings(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
-		// Different response based on which endpoint is called
-		if strings.Contains(path, "embedContent") {
-			// Single embedding
-			w.WriteHeader(http.StatusOK)
-			if _, err := w.Write([]byte(`{
-				"embedding": {
-					"values": [0.1, 0.2, 0.3, 0.4, 0.5],
-					"statistics": {
-						"truncatedInputTokenCount": 0,
-						"tokenCount": 4
-					}
-				},
-				"usageMetadata": {
-					"promptTokenCount": 4,
-					"candidatesTokenCount": 0,
-					"totalTokenCount": 4
-				}
-			}`)); err != nil {
-				t.Fatalf("Failed to write")
-			}
-		} else if strings.Contains(path, "batchEmbedContents") {
-			// Batch embeddings
+		// The genai SDK always routes Gemini-API embedding requests through
+		// the `:batchEmbedContents` endpoint, even for single inputs. The
+		// previous mock branched on `embedContent` first, but since
+		// "batchEmbedContents" contains that substring, we now match the
+		// more-specific path first.
+		if strings.Contains(path, "batchEmbedContents") {
+			// Batch embeddings (genai SDK wire shape)
 			w.WriteHeader(http.StatusOK)
 			if _, err := w.Write([]byte(`{
 				"embeddings": [
 					{
-						"embedding": {
-							"values": [0.1, 0.2, 0.3],
-							"statistics": {
-								"truncatedInputTokenCount": 0,
-								"tokenCount": 2
-							}
-						},
-						"usageMetadata": {
-							"promptTokenCount": 2,
-							"totalTokenCount": 2
+						"values": [0.1, 0.2, 0.3],
+						"statistics": {
+							"truncatedInputTokenCount": 0,
+							"tokenCount": 2
 						}
 					},
 					{
-						"embedding": {
-							"values": [0.4, 0.5, 0.6],
-							"statistics": {
-								"truncatedInputTokenCount": 0,
-								"tokenCount": 2
-							}
-						},
-						"usageMetadata": {
-							"promptTokenCount": 2,
-							"totalTokenCount": 2
+						"values": [0.4, 0.5, 0.6],
+						"statistics": {
+							"truncatedInputTokenCount": 0,
+							"tokenCount": 2
 						}
 					}
 				]
@@ -559,8 +532,11 @@ func TestGeminiLLM_Embeddings(t *testing.T) {
 		result, err := llm.CreateEmbedding(context.Background(), "Test text")
 		assert.NoError(t, err)
 		assert.NotNil(t, result)
-		assert.Len(t, result.Vector, 5)
-		assert.Equal(t, 4, result.TokenCount)
+		// The mock returns the SDK's batch response shape (an embeddings
+		// array); CreateEmbedding picks the first entry, which has a 3-vector
+		// and a per-embedding statistics token count of 2.
+		assert.Len(t, result.Vector, 3)
+		assert.Equal(t, 2, result.TokenCount)
 		assert.NotNil(t, result.Metadata)
 	})
 
@@ -822,6 +798,8 @@ func TestGeminiLLM_GenerateWithTools_PreservesThoughtSignature(t *testing.T) {
 		assert.Equal(t, "call-1", reqBody.Contents[1].Parts[0].FunctionResponse.ID)
 		assert.Equal(t, "search", reqBody.Contents[1].Parts[0].FunctionResponse.Name)
 
+		// thoughtSignature is base64-encoded on the wire (the SDK type is []byte).
+		// "c2lnLXRob3VnaHQ=" decodes to "sig-thought", "c2lnLWNhbGw=" to "sig-call".
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
 			"candidates": [{
@@ -830,7 +808,7 @@ func TestGeminiLLM_GenerateWithTools_PreservesThoughtSignature(t *testing.T) {
 						{
 							"text": "Need to use search",
 							"thought": true,
-							"thoughtSignature": "sig-thought"
+							"thoughtSignature": "c2lnLXRob3VnaHQ="
 						},
 						{
 							"functionCall": {
@@ -839,7 +817,7 @@ func TestGeminiLLM_GenerateWithTools_PreservesThoughtSignature(t *testing.T) {
 								"args": {"query": "gemini"}
 							},
 							"thought": true,
-							"thoughtSignature": "sig-call"
+							"thoughtSignature": "c2lnLWNhbGw="
 						}
 					]
 				}
@@ -1099,17 +1077,19 @@ func TestGeminiLLM_StreamGenerate_ChunkHandling(t *testing.T) {
 		flusher, ok := w.(http.Flusher)
 		require.True(t, ok, "Flusher interface not supported")
 
-		// Send a series of chunks with delays to simulate streaming
+		// Send a series of chunks with delays to simulate streaming.
+		// The genai SDK's SSE scanner splits on `\n\n`, so each event must
+		// terminate with a blank line. The real Gemini API does not emit a
+		// `[DONE]` sentinel, so we omit it here.
 		chunks := []string{
 			`data: {"candidates":[{"content":{"parts":[{"text":"Once"}]}}]}`,
 			`data: {"candidates":[{"content":{"parts":[{"text":" upon"}]}}]}`,
 			`data: {"candidates":[{"content":{"parts":[{"text":" a"}]}}]}`,
 			`data: {"candidates":[{"content":{"parts":[{"text":" time"}]}}]}`,
-			`data: [DONE]`,
 		}
 
 		for _, chunk := range chunks {
-			fmt.Fprintln(w, chunk)
+			fmt.Fprintf(w, "%s\n\n", chunk)
 			flusher.Flush()
 			time.Sleep(50 * time.Millisecond)
 		}
@@ -1716,12 +1696,13 @@ func TestGeminiLLM_Generate_Gemini3IncludesThinkingConfig(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, reqBody.GenerationConfig.ThinkingConfig)
 		assert.True(t, reqBody.GenerationConfig.ThinkingConfig.IncludeThoughts)
+		// thoughtSignature is base64-encoded on the wire ("c2lnLTE=" → "sig-1").
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
 			"candidates": [{
 				"content": {
 					"parts": [
-						{"text": "reasoning", "thought": true, "thoughtSignature": "sig-1"},
+						{"text": "reasoning", "thought": true, "thoughtSignature": "c2lnLTE="},
 						{"text": "final answer"}
 					]
 				}
@@ -1763,27 +1744,27 @@ func TestGeminiLLM_Generate_Gemini3IncludesThinkingConfig(t *testing.T) {
 }
 
 func TestGeminiLLM_CreateEmbedding_Options(t *testing.T) {
+	// The genai SDK serializes Gemini-API embed requests as
+	// {"requests": [{"model": "models/...", "content": {"parts": [...]}, ...}]}.
+	// Each test verifies the first entry of `requests`.
+	type expectedRequest struct {
+		model    string
+		text     string
+		taskType string
+	}
+
 	testCases := []struct {
 		name         string
 		input        string
 		options      []core.EmbeddingOption
-		expectedReq  map[string]interface{}
+		expected     expectedRequest
 		validRequest bool
 	}{
 		{
-			name:    "Default options",
-			input:   "Test input",
-			options: []core.EmbeddingOption{},
-			expectedReq: map[string]interface{}{
-				"model": "models/text-embedding-004",
-				"content": map[string]interface{}{
-					"parts": []interface{}{
-						map[string]interface{}{
-							"text": "Test input",
-						},
-					},
-				},
-			},
+			name:         "Default options",
+			input:        "Test input",
+			options:      []core.EmbeddingOption{},
+			expected:     expectedRequest{model: "models/text-embedding-004", text: "Test input"},
 			validRequest: true,
 		},
 		{
@@ -1792,16 +1773,7 @@ func TestGeminiLLM_CreateEmbedding_Options(t *testing.T) {
 			options: []core.EmbeddingOption{
 				core.WithModel("gemini-embedding-exp-03-07"),
 			},
-			expectedReq: map[string]interface{}{
-				"model": "models/gemini-embedding-exp-03-07",
-				"content": map[string]interface{}{
-					"parts": []interface{}{
-						map[string]interface{}{
-							"text": "Test input",
-						},
-					},
-				},
-			},
+			expected:     expectedRequest{model: "models/gemini-embedding-exp-03-07", text: "Test input"},
 			validRequest: true,
 		},
 		{
@@ -1820,20 +1792,7 @@ func TestGeminiLLM_CreateEmbedding_Options(t *testing.T) {
 					"task_type": "retrieval_query",
 				}),
 			},
-			expectedReq: map[string]interface{}{
-				"model": "models/text-embedding-004",
-				"content": map[string]interface{}{
-					"parts": []interface{}{
-						map[string]interface{}{
-							"text": "Test input",
-						},
-					},
-				},
-				"taskType": "retrieval_query",
-				"parameters": map[string]interface{}{
-					"task_type": "retrieval_query",
-				},
-			},
+			expected:     expectedRequest{model: "models/text-embedding-004", text: "Test input", taskType: "retrieval_query"},
 			validRequest: true,
 		},
 		{
@@ -1845,20 +1804,7 @@ func TestGeminiLLM_CreateEmbedding_Options(t *testing.T) {
 					"truncateStrategy": "START",
 				}),
 			},
-			expectedReq: map[string]interface{}{
-				"model": "models/text-embedding-004",
-				"content": map[string]interface{}{
-					"parts": []interface{}{
-						map[string]interface{}{
-							"text": "Test input",
-						},
-					},
-				},
-				"parameters": map[string]interface{}{
-					"dimension":        float64(768),
-					"truncateStrategy": "START",
-				},
-			},
+			expected:     expectedRequest{model: "models/text-embedding-004", text: "Test input"},
 			validRequest: true,
 		},
 	}
@@ -1867,53 +1813,52 @@ func TestGeminiLLM_CreateEmbedding_Options(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Create test server
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				// Check URL contains embedContent
-				assert.Contains(t, r.URL.Path, "embedContent")
+				// The SDK always routes Gemini-API embed traffic through
+				// `:batchEmbedContents`, even for a single input.
+				assert.Contains(t, r.URL.Path, "batchEmbedContents")
 
-				// Read and verify request body
 				body, err := io.ReadAll(r.Body)
 				assert.NoError(t, err)
 
-				var reqMap map[string]interface{}
-				err = json.Unmarshal(body, &reqMap)
-				assert.NoError(t, err)
+				if tc.validRequest {
+					var reqMap map[string]interface{}
+					err = json.Unmarshal(body, &reqMap)
+					assert.NoError(t, err)
 
-				// Check key elements match expectations
-				for key, expectedValue := range tc.expectedReq {
-					actualValue, exists := reqMap[key]
-					assert.True(t, exists, "Expected key '%s' in request", key)
+					requests, ok := reqMap["requests"].([]interface{})
+					if assert.True(t, ok, "Expected `requests` array in body") && len(requests) > 0 {
+						first, ok := requests[0].(map[string]interface{})
+						assert.True(t, ok, "Expected first request to be a map")
+						assert.Equal(t, tc.expected.model, first["model"], "model")
 
-					// For maps, check individual fields
-					switch expectedMap := expectedValue.(type) {
-					case map[string]interface{}:
-						actualMap, ok := actualValue.(map[string]interface{})
-						assert.True(t, ok, "Expected %s to be a map", key)
-
-						for subKey, subVal := range expectedMap {
-							actualSubVal, exists := actualMap[subKey]
-							assert.True(t, exists, "Expected subkey '%s' in %s", subKey, key)
-							assert.Equal(t, subVal, actualSubVal)
+						content, ok := first["content"].(map[string]interface{})
+						if assert.True(t, ok, "Expected content map") {
+							parts, ok := content["parts"].([]interface{})
+							if assert.True(t, ok, "Expected parts array") && len(parts) > 0 {
+								firstPart, ok := parts[0].(map[string]interface{})
+								if assert.True(t, ok, "Expected first part map") {
+									assert.Equal(t, tc.expected.text, firstPart["text"])
+								}
+							}
 						}
-					default:
-						assert.Equal(t, expectedValue, actualValue)
+						if tc.expected.taskType != "" {
+							assert.Equal(t, tc.expected.taskType, first["taskType"], "taskType")
+						}
 					}
 				}
 
-				// Send successful response
+				// Send successful response in the SDK's expected wire shape.
 				w.WriteHeader(http.StatusOK)
 				if _, err := w.Write([]byte(`{
-					"embedding": {
-						"values": [0.1, 0.2, 0.3, 0.4, 0.5],
-						"statistics": {
-							"truncatedInputTokenCount": 0,
-							"tokenCount": 4
+					"embeddings": [
+						{
+							"values": [0.1, 0.2, 0.3, 0.4, 0.5],
+							"statistics": {
+								"truncatedInputTokenCount": 0,
+								"tokenCount": 4
+							}
 						}
-					},
-					"usageMetadata": {
-						"promptTokenCount": 4,
-						"candidatesTokenCount": 0,
-						"totalTokenCount": 4
-					}
+					]
 				}`)); err != nil {
 					t.Fatalf("Failed to write response")
 				}
@@ -2027,28 +1972,22 @@ func TestGeminiLLM_CreateEmbeddings_BatchProcessing(t *testing.T) {
 						return
 					}
 
-					// Create mock batch response with a result for each input
-					responseObj := map[string]interface{}{
-						"embeddings": make([]interface{}, len(requests)),
-					}
-
+					// Build a mock response in the SDK's wire shape: each
+					// element is a ContentEmbedding directly (no nested
+					// `embedding` field).
+					embeddings := make([]interface{}, len(requests))
 					for i := range requests {
-						responseObj["embeddings"].([]interface{})[i] = map[string]interface{}{
-							"embedding": map[string]interface{}{
-								"values": []float64{0.1, 0.2, 0.3},
-								"statistics": map[string]interface{}{
-									"truncatedInputTokenCount": 0,
-									"tokenCount":               2,
-								},
-							},
-							"usageMetadata": map[string]interface{}{
-								"promptTokenCount": 2,
-								"totalTokenCount":  2,
+						embeddings[i] = map[string]interface{}{
+							"values": []float64{0.1, 0.2, 0.3},
+							"statistics": map[string]interface{}{
+								"truncatedInputTokenCount": 0,
+								"tokenCount":               2,
 							},
 						}
 					}
-
-					respBytes, _ := json.Marshal(responseObj)
+					respBytes, _ := json.Marshal(map[string]interface{}{
+						"embeddings": embeddings,
+					})
 					w.WriteHeader(http.StatusOK)
 					_, _ = w.Write(respBytes)
 				} else {
