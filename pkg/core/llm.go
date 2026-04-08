@@ -632,7 +632,8 @@ const (
 	// Google Gemini models (existing).
 	ModelGoogleGeminiFlash     ModelID = "gemini-2.5-flash"
 	ModelGoogleGeminiPro       ModelID = "gemini-2.5-pro"
-	ModelGoogleGeminiFlashLite ModelID = "gemini-2.5-flash-lite"
+	ModelGoogleGeminiFlashLite  ModelID = "gemini-2.5-flash-lite"
+	ModelGoogleGeminiFlashImage ModelID = "gemini-2.5-flash-image"
 	// Google Gemini 3 series (new).
 	ModelGoogleGemini3ProPreview   ModelID = "gemini-3-pro-preview"
 	ModelGoogleGemini3FlashPreview ModelID = "gemini-3-flash-preview"
@@ -720,7 +721,7 @@ var ProviderModels = map[string][]ModelID{
 		ModelAnthropicClaude45Opus, ModelAnthropicClaude46Sonnet, ModelAnthropicClaude46Opus,
 	},
 	"google": {
-		ModelGoogleGeminiFlash, ModelGoogleGeminiPro, ModelGoogleGeminiFlashLite,
+		ModelGoogleGeminiFlash, ModelGoogleGeminiPro, ModelGoogleGeminiFlashLite, ModelGoogleGeminiFlashImage,
 		ModelGoogleGemini3ProPreview, ModelGoogleGemini3FlashPreview,
 		ModelGoogleGemini20Flash, ModelGoogleGemini20FlashLite,
 	},

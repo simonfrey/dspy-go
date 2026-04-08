@@ -212,11 +212,15 @@ func NewGeminiLLM(apiKey string, model core.ModelID) (*GeminiLLM, error) {
 		core.CapabilityVision,
 		core.CapabilityAudio,
 	}
+	if model == core.ModelGoogleGeminiFlashImage {
+		capabilities = append(capabilities, core.CapabilityImageGeneration)
+	}
 	// Validate model ID
 	switch model {
 	case core.ModelGoogleGeminiPro, core.ModelGoogleGeminiFlash, core.ModelGoogleGeminiFlashLite,
 		core.ModelGoogleGemini3ProPreview, core.ModelGoogleGemini3FlashPreview,
-		core.ModelGoogleGemini20Flash, core.ModelGoogleGemini20FlashLite:
+		core.ModelGoogleGemini20Flash, core.ModelGoogleGemini20FlashLite,
+		core.ModelGoogleGeminiFlashImage:
 		break
 	default:
 		return nil, errors.WithFields(
@@ -303,6 +307,9 @@ func NewGeminiLLMFromConfig(ctx context.Context, config core.ProviderConfig, mod
 		core.CapabilityVision,
 		core.CapabilityAudio,
 	}
+	if modelID == core.ModelGoogleGeminiFlashImage {
+		capabilities = append(capabilities, core.CapabilityImageGeneration)
+	}
 
 	// Check if streaming is supported
 	if supportsGeminiStreaming(modelID) {
@@ -332,7 +339,8 @@ var validGeminiModels = []core.ModelID{
 	// Gemini 2.5 series (existing)
 	core.ModelGoogleGeminiFlash,     // gemini-2.5-flash
 	core.ModelGoogleGeminiPro,       // gemini-2.5-pro
-	core.ModelGoogleGeminiFlashLite, // gemini-2.5-flash-lite
+	core.ModelGoogleGeminiFlashLite,  // gemini-2.5-flash-lite
+	core.ModelGoogleGeminiFlashImage, // gemini-2.5-flash-image
 	// Gemini 3 series (new)
 	core.ModelGoogleGemini3ProPreview,   // gemini-3-pro-preview
 	core.ModelGoogleGemini3FlashPreview, // gemini-3-flash-preview
