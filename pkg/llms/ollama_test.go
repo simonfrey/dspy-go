@@ -2,6 +2,7 @@ package llms
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1121,4 +1122,36 @@ func TestOllamaLLM_ConcurrentStreaming(t *testing.T) {
 	for i, result := range results {
 		assert.Equal(t, "chunk_0 chunk_1 chunk_2 chunk_3 chunk_4 ", result, "Stream %d failed", i)
 	}
+}
+
+func TestOllamaLLM_NativeImageOutput(t *testing.T) {
+	pngBytes := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+	pngB64 := base64.StdEncoding.EncodeToString(pngBytes)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/generate", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := &ollamaapi.GenerateResponse{
+			Model:    "fake-image-model",
+			Response: "generated",
+			Image:    pngB64,
+			Done:     true,
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(resp))
+	}))
+	defer server.Close()
+
+	llm, err := NewOllamaLLM("fake-image-model", WithBaseURL(server.URL), WithNativeAPI())
+	require.NoError(t, err)
+
+	resp, err := llm.Generate(context.Background(), "draw a cat")
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "generated", resp.Content)
+
+	imageBlocks := resp.ImageBlocks()
+	require.Len(t, imageBlocks, 1)
+	assert.Equal(t, "image/png", imageBlocks[0].MimeType)
+	assert.Equal(t, pngBytes, imageBlocks[0].Data)
 }

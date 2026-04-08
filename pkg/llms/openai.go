@@ -110,6 +110,9 @@ func NewOpenAILLM(modelID core.ModelID, opts ...OpenAIOption) (*OpenAILLM, error
 		core.CapabilityEmbedding,
 		core.CapabilityToolCalling,
 	}
+	if isOpenAIImageModel(string(modelID)) {
+		capabilities = append(capabilities, core.CapabilityImageGeneration)
+	}
 
 	baseLLM := core.NewBaseLLM("openai", modelID, capabilities, endpointCfg)
 
@@ -311,11 +314,24 @@ func isValidOpenAIModel(modelID core.ModelID) bool {
 	return isValidModelInList(modelID, validOpenAIModels)
 }
 
+// isOpenAIImageModel reports whether the model is an OpenAI image-generation
+// model that must be invoked via the dedicated /v1/images/generations endpoint
+// (not chat completions). Covers gpt-image-* and dall-e-* families.
+func isOpenAIImageModel(modelID string) bool {
+	m := strings.ToLower(strings.TrimSpace(modelID))
+	return strings.HasPrefix(m, "gpt-image") || strings.HasPrefix(m, "dall-e")
+}
+
 // Generate implements the core.LLM interface.
 func (o *OpenAILLM) Generate(ctx context.Context, prompt string, options ...core.GenerateOption) (*core.LLMResponse, error) {
 	opts := core.NewGenerateOptions()
 	for _, opt := range options {
 		opt(opts)
+	}
+
+	// Image-generation models live on a separate endpoint, not chat completions.
+	if isOpenAIImageModel(o.ModelID()) {
+		return o.generateImage(ctx, prompt, opts)
 	}
 
 	params := openaisdk.ChatCompletionNewParams{
@@ -751,6 +767,12 @@ func (o *OpenAILLM) GenerateWithContent(ctx context.Context, content []core.Cont
 		opt(opts)
 	}
 
+	// Image-generation models accept only a text prompt today; image-input
+	// editing flows live on a different endpoint and are out of scope.
+	if isOpenAIImageModel(o.ModelID()) {
+		return o.generateImage(ctx, contentBlocksToTextPrompt(content), opts)
+	}
+
 	parts, err := convertContentBlocksToOpenAIParts(content)
 	if err != nil {
 		return nil, err
@@ -791,6 +813,108 @@ func (o *OpenAILLM) GenerateWithContent(ctx context.Context, content []core.Cont
 			"model":         response.Model,
 		},
 	}, nil
+}
+
+// generateImage invokes the OpenAI Images API for image-generation models like
+// gpt-image-1 and dall-e-3. The decoded image bytes are returned as image
+// ContentBlocks on the LLMResponse.
+func (o *OpenAILLM) generateImage(ctx context.Context, prompt string, opts *core.GenerateOptions) (*core.LLMResponse, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return nil, errors.New(errors.InvalidInput, "image generation requires a non-empty text prompt")
+	}
+
+	params := openaisdk.ImageGenerateParams{
+		Model:  openaisdk.ImageModel(o.ModelID()),
+		Prompt: prompt,
+		// gpt-image-* models always return base64; dall-e-* default to URL,
+		// so request b64_json explicitly so the byte path is uniform.
+		ResponseFormat: openaisdk.ImageGenerateParamsResponseFormatB64JSON,
+	}
+
+	resp, err := o.client.Images.Generate(ctx, params)
+	if err != nil {
+		return nil, errors.WithFields(
+			errors.Wrap(err, errors.LLMGenerationFailed, "OpenAI image generation failed"),
+			errors.Fields{"model": o.ModelID()},
+		)
+	}
+	if resp == nil || len(resp.Data) == 0 {
+		return nil, errors.WithFields(
+			errors.New(errors.InvalidResponse, "no images returned from OpenAI image API"),
+			errors.Fields{"model": o.ModelID()},
+		)
+	}
+
+	mimeType := openAIImageMimeFromResponse(resp.OutputFormat)
+	contentBlocks := make([]core.ContentBlock, 0, len(resp.Data))
+	for _, img := range resp.Data {
+		if img.B64JSON == "" {
+			// dall-e fallback path: if a URL is returned, surface it as
+			// metadata on a text block instead of fetching the URL ourselves.
+			if img.URL != "" {
+				block := core.NewTextBlock(img.URL)
+				if block.Metadata == nil {
+					block.Metadata = map[string]any{}
+				}
+				block.Metadata["openai_image_url"] = img.URL
+				contentBlocks = append(contentBlocks, block)
+			}
+			continue
+		}
+		data, decodeErr := base64.StdEncoding.DecodeString(img.B64JSON)
+		if decodeErr != nil {
+			return nil, errors.WithFields(
+				errors.Wrap(decodeErr, errors.InvalidResponse, "failed to decode OpenAI image base64"),
+				errors.Fields{"model": o.ModelID()},
+			)
+		}
+		contentBlocks = append(contentBlocks, core.NewImageBlock(data, mimeType))
+	}
+
+	usage := &core.TokenInfo{
+		PromptTokens:     int(resp.Usage.InputTokens),
+		CompletionTokens: int(resp.Usage.OutputTokens),
+		TotalTokens:      int(resp.Usage.TotalTokens),
+	}
+
+	return &core.LLMResponse{
+		ContentBlocks: contentBlocks,
+		Usage:         usage,
+		Metadata: map[string]interface{}{
+			"model": o.ModelID(),
+		},
+	}, nil
+}
+
+// openAIImageMimeFromResponse maps the OutputFormat field on the Images API
+// response to a MIME type. Defaults to image/png when unset.
+func openAIImageMimeFromResponse(format openaisdk.ImagesResponseOutputFormat) string {
+	switch format {
+	case openaisdk.ImagesResponseOutputFormatJPEG:
+		return "image/jpeg"
+	case openaisdk.ImagesResponseOutputFormatWebP:
+		return "image/webp"
+	case openaisdk.ImagesResponseOutputFormatPNG:
+		return "image/png"
+	default:
+		return "image/png"
+	}
+}
+
+// contentBlocksToTextPrompt joins the text blocks of a multimodal content
+// slice into a single prompt string. Used when routing to the OpenAI Images
+// API, which only accepts a text prompt.
+func contentBlocksToTextPrompt(content []core.ContentBlock) string {
+	var sb strings.Builder
+	for _, block := range content {
+		if block.Type == core.FieldTypeText && block.Text != "" {
+			if sb.Len() > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(block.Text)
+		}
+	}
+	return sb.String()
 }
 
 // StreamGenerateWithContent streams a response from a multimodal content prompt.

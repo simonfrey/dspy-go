@@ -583,3 +583,31 @@ func TestAnthropicProviderFactory(t *testing.T) {
 		assert.Nil(t, llm)
 	})
 }
+
+func TestAnthropicLLM_RejectsImageOutput(t *testing.T) {
+	llm, err := NewAnthropicLLMFromConfig(context.Background(), core.ProviderConfig{
+		Name:   "anthropic",
+		APIKey: "test-key",
+	}, core.ModelID("claude-sonnet-4-5"))
+	require.NoError(t, err)
+
+	// Generate path
+	_, err = llm.Generate(context.Background(), "draw a cat",
+		core.WithResponseModalities("image"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Anthropic models do not support image output")
+
+	// GenerateWithContent path
+	_, err = llm.GenerateWithContent(context.Background(),
+		[]core.ContentBlock{core.NewTextBlock("draw a cat")},
+		core.WithResponseModalities("text", "image"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Anthropic models do not support image output")
+
+	// Sanity: a text-only modality request should not be rejected upfront.
+	// We don't make a real API call, so we just check the rejection helper
+	// directly via the same option but with no image modality.
+	opts := core.NewGenerateOptions()
+	core.WithResponseModalities("text")(opts)
+	assert.NoError(t, rejectAnthropicImageOutput(opts))
+}

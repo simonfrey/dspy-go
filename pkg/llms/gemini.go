@@ -93,10 +93,11 @@ type geminiFileData struct {
 }
 
 type geminiGenerationConfig struct {
-	Temperature     float64               `json:"temperature,omitempty"`
-	MaxOutputTokens int                   `json:"maxOutputTokens,omitempty"`
-	TopP            float64               `json:"topP,omitempty"`
-	ThinkingConfig  *geminiThinkingConfig `json:"thinkingConfig,omitempty"`
+	Temperature        float64               `json:"temperature,omitempty"`
+	MaxOutputTokens    int                   `json:"maxOutputTokens,omitempty"`
+	TopP               float64               `json:"topP,omitempty"`
+	ThinkingConfig     *geminiThinkingConfig `json:"thinkingConfig,omitempty"`
+	ResponseModalities []string              `json:"responseModalities,omitempty"`
 }
 
 type geminiThinkingConfig struct {
@@ -377,14 +378,41 @@ func supportsGeminiThoughtSignatures(modelID core.ModelID) bool {
 // caller receives the signatures needed for subsequent function-response turns.
 func (g *GeminiLLM) buildGenerationConfig(opts *core.GenerateOptions) geminiGenerationConfig {
 	cfg := geminiGenerationConfig{
-		Temperature:     opts.Temperature,
-		MaxOutputTokens: opts.MaxTokens,
-		TopP:            opts.TopP,
+		Temperature:        opts.Temperature,
+		MaxOutputTokens:    opts.MaxTokens,
+		TopP:               opts.TopP,
+		ResponseModalities: normalizeGeminiResponseModalities(opts.ResponseModalities),
 	}
 	if supportsGeminiThoughtSignatures(core.ModelID(g.ModelID())) {
 		cfg.ThinkingConfig = &geminiThinkingConfig{IncludeThoughts: true}
 	}
 	return cfg
+}
+
+// normalizeGeminiResponseModalities maps the dspy-go modality strings ("text",
+// "image", "audio") to the Gemini API's uppercase form ("TEXT", "IMAGE",
+// "AUDIO"). Unknown values are passed through as-is so callers can supply any
+// future SDK constant.
+func normalizeGeminiResponseModalities(modalities []string) []string {
+	if len(modalities) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(modalities))
+	for _, m := range modalities {
+		switch strings.ToLower(strings.TrimSpace(m)) {
+		case "":
+			continue
+		case "text":
+			out = append(out, "TEXT")
+		case "image":
+			out = append(out, "IMAGE")
+		case "audio":
+			out = append(out, "AUDIO")
+		default:
+			out = append(out, strings.ToUpper(m))
+		}
+	}
+	return out
 }
 
 func geminiUsageToTokenInfo(metadata struct {
@@ -459,6 +487,30 @@ func buildGeminiContentResponse(parts []geminiPart) (string, []core.ContentBlock
 				}
 			}
 			toolCalls = append(toolCalls, call)
+		}
+
+		// Image / audio outputs are returned as inlineData parts on the
+		// candidate (e.g. gemini-2.5-flash-image returns generated images).
+		// sdkPartToLegacy already base64-encodes the SDK Blob.Data into
+		// InlineData.Data, so we decode it back to raw bytes for the caller.
+		if part.InlineData != nil {
+			data, err := base64.StdEncoding.DecodeString(part.InlineData.Data)
+			if err != nil {
+				// If the data isn't valid base64 (shouldn't happen given the
+				// SDK round-trip) fall back to the raw string bytes so we
+				// don't drop the payload entirely.
+				data = []byte(part.InlineData.Data)
+			}
+			block := core.ContentBlock{
+				Data:     data,
+				MimeType: part.InlineData.MimeType,
+			}
+			if strings.HasPrefix(part.InlineData.MimeType, "audio/") {
+				block.Type = core.FieldTypeAudio
+			} else {
+				block.Type = core.FieldTypeImage
+			}
+			contentBlocks = append(contentBlocks, block)
 		}
 	}
 
@@ -810,6 +862,10 @@ func legacyRequestToSDKConfig(req geminiRequest) *genai.GenerateContentConfig {
 			IncludeThoughts: req.GenerationConfig.ThinkingConfig.IncludeThoughts,
 		}
 	}
+	if len(req.GenerationConfig.ResponseModalities) > 0 {
+		cfg.ResponseModalities = make([]string, len(req.GenerationConfig.ResponseModalities))
+		copy(cfg.ResponseModalities, req.GenerationConfig.ResponseModalities)
+	}
 	if len(req.Tools) > 0 {
 		cfg.Tools = make([]*genai.Tool, 0, len(req.Tools))
 		for _, t := range req.Tools {
@@ -1030,7 +1086,7 @@ func (g *GeminiLLM) Generate(ctx context.Context, prompt string, options ...core
 			})
 	}
 
-	content, _, _, responseMetadata := buildGeminiContentResponse(geminiResp.Candidates[0].Content.Parts)
+	content, contentBlocks, _, responseMetadata := buildGeminiContentResponse(geminiResp.Candidates[0].Content.Parts)
 	usage := geminiUsageToTokenInfo(geminiResp.UsageMetadata)
 	metadata := geminiUsageMetadataMap(geminiResp.UsageMetadata)
 	for key, value := range responseMetadata {
@@ -1038,9 +1094,10 @@ func (g *GeminiLLM) Generate(ctx context.Context, prompt string, options ...core
 	}
 
 	return &core.LLMResponse{
-		Content:  content,
-		Usage:    usage,
-		Metadata: metadata,
+		Content:       content,
+		ContentBlocks: contentBlocks,
+		Usage:         usage,
+		Metadata:      metadata,
 	}, nil
 }
 
@@ -1676,7 +1733,7 @@ func (g *GeminiLLM) GenerateWithContent(ctx context.Context, content []core.Cont
 			})
 	}
 
-	contentText, _, _, responseMetadata := buildGeminiContentResponse(geminiResp.Candidates[0].Content.Parts)
+	contentText, contentBlocks, _, responseMetadata := buildGeminiContentResponse(geminiResp.Candidates[0].Content.Parts)
 	usage := geminiUsageToTokenInfo(geminiResp.UsageMetadata)
 	metadata := geminiUsageMetadataMap(geminiResp.UsageMetadata)
 	for key, value := range responseMetadata {
@@ -1684,9 +1741,10 @@ func (g *GeminiLLM) GenerateWithContent(ctx context.Context, content []core.Cont
 	}
 
 	return &core.LLMResponse{
-		Content:  contentText,
-		Usage:    usage,
-		Metadata: metadata,
+		Content:       contentText,
+		ContentBlocks: contentBlocks,
+		Usage:         usage,
+		Metadata:      metadata,
 	}, nil
 }
 

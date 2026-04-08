@@ -2,6 +2,7 @@ package llms
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2185,4 +2186,72 @@ func TestGeminiLLM_CreateEmbedding_ErrorHandling(t *testing.T) {
 			assert.Nil(t, result)
 		})
 	}
+}
+
+func TestGeminiLLM_GenerateWithImageOutput(t *testing.T) {
+	// PNG header bytes — small but distinguishable payload to round-trip.
+	pngBytes := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+	pngB64 := base64.StdEncoding.EncodeToString(pngBytes)
+
+	var capturedReq geminiRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&capturedReq))
+
+		resp := geminiResponse{}
+		resp.Candidates = []struct {
+			Content struct {
+				Parts []geminiPart `json:"parts"`
+			} `json:"content"`
+			FinishReason string `json:"finishReason,omitempty"`
+		}{
+			{
+				Content: struct {
+					Parts []geminiPart `json:"parts"`
+				}{
+					Parts: []geminiPart{
+						{Text: "Here is your image:"},
+						{InlineData: &geminiInlineData{MimeType: "image/png", Data: pngB64}},
+					},
+				},
+			},
+		}
+		w.WriteHeader(http.StatusOK)
+		require.NoError(t, json.NewEncoder(w).Encode(resp))
+	}))
+	defer server.Close()
+
+	endpoint := &core.EndpointConfig{
+		BaseURL:    server.URL,
+		Path:       "/models/gemini-2.5-flash-image:generateContent",
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		TimeoutSec: 30,
+	}
+	llm := &GeminiLLM{
+		apiKey: "test-api-key",
+		BaseLLM: core.NewBaseLLM(
+			"google",
+			core.ModelID("gemini-2.5-flash-image"),
+			[]core.Capability{core.CapabilityCompletion, core.CapabilityImageGeneration},
+			endpoint,
+		),
+	}
+
+	resp, err := llm.Generate(context.Background(), "draw a cat",
+		core.WithResponseModalities("text", "image"))
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	// The request should have included the responseModalities config so the
+	// model knows to emit image parts.
+	assert.ElementsMatch(t, []string{"TEXT", "IMAGE"}, capturedReq.GenerationConfig.ResponseModalities)
+
+	// Text portion still flows through .Content for backward compatibility.
+	assert.Equal(t, "Here is your image:", resp.Content)
+
+	// ContentBlocks carries the image bytes.
+	imageBlocks := resp.ImageBlocks()
+	require.Len(t, imageBlocks, 1)
+	assert.Equal(t, core.FieldTypeImage, imageBlocks[0].Type)
+	assert.Equal(t, "image/png", imageBlocks[0].MimeType)
+	assert.Equal(t, pngBytes, imageBlocks[0].Data)
 }

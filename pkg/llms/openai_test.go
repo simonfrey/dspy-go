@@ -2,6 +2,7 @@ package llms
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1813,4 +1814,116 @@ func TestOptionsChaining(t *testing.T) {
 	if endpoint.Headers["Content-Type"] != "application/json" {
 		t.Errorf("expected Content-Type application/json, got %s", endpoint.Headers["Content-Type"])
 	}
+}
+
+func TestOpenAILLM_GenerateImageModel(t *testing.T) {
+	pngBytes := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+	pngB64 := base64.StdEncoding.EncodeToString(pngBytes)
+
+	var capturedPath string
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		capturedBody = body
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"created": 1234567890,
+			"data": [{"b64_json": "` + pngB64 + `"}],
+			"output_format": "png",
+			"usage": {"input_tokens": 12, "output_tokens": 1, "total_tokens": 13, "input_tokens_details": {"image_tokens": 0, "text_tokens": 12}}
+		}`))
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	llm, err := NewOpenAILLMFromConfig(ctx, core.ProviderConfig{
+		Name:   "openai",
+		APIKey: "test-api-key",
+		Endpoint: &core.EndpointConfig{
+			BaseURL:    server.URL,
+			TimeoutSec: 30,
+		},
+	}, core.ModelID("gpt-image-1"))
+	require.NoError(t, err)
+
+	// Capability advertised for image models.
+	caps := llm.Capabilities()
+	found := false
+	for _, c := range caps {
+		if c == core.CapabilityImageGeneration {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected CapabilityImageGeneration on gpt-image-1")
+
+	resp, err := llm.Generate(ctx, "a cat on a skateboard")
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	// The Images endpoint, not chat completions, should have been hit.
+	assert.Contains(t, capturedPath, "images/generations")
+
+	// Wire format should request b64_json so the byte path is uniform.
+	var reqBody map[string]any
+	require.NoError(t, json.Unmarshal(capturedBody, &reqBody))
+	assert.Equal(t, "a cat on a skateboard", reqBody["prompt"])
+	assert.Equal(t, "b64_json", reqBody["response_format"])
+	assert.Equal(t, "gpt-image-1", reqBody["model"])
+
+	// Image bytes should round-trip into ContentBlocks.
+	imageBlocks := resp.ImageBlocks()
+	require.Len(t, imageBlocks, 1)
+	assert.Equal(t, "image/png", imageBlocks[0].MimeType)
+	assert.Equal(t, pngBytes, imageBlocks[0].Data)
+
+	// Usage was extracted.
+	require.NotNil(t, resp.Usage)
+	assert.Equal(t, 12, resp.Usage.PromptTokens)
+	assert.Equal(t, 1, resp.Usage.CompletionTokens)
+	assert.Equal(t, 13, resp.Usage.TotalTokens)
+}
+
+func TestOpenAILLM_NonImageModelStillUsesChatCompletions(t *testing.T) {
+	var capturedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		response := openai.ChatCompletionResponse{
+			ID:      "test-id",
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   "gpt-4o",
+			Choices: []openai.ChatChoice{{
+				Index: 0,
+				Message: openai.ChatCompletionMessage{
+					Role:    "assistant",
+					Content: "hello",
+				},
+				FinishReason: "stop",
+			}},
+			Usage: openai.CompletionUsage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(response))
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	llm, err := NewOpenAILLMFromConfig(ctx, core.ProviderConfig{
+		Name:   "openai",
+		APIKey: "test-api-key",
+		Endpoint: &core.EndpointConfig{
+			BaseURL:    server.URL,
+			TimeoutSec: 30,
+		},
+	}, core.ModelOpenAIGPT4o)
+	require.NoError(t, err)
+
+	resp, err := llm.Generate(ctx, "hi")
+	require.NoError(t, err)
+	assert.Equal(t, "hello", resp.Content)
+	assert.Contains(t, capturedPath, "chat/completions")
 }

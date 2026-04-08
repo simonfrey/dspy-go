@@ -193,12 +193,35 @@ func isValidAnthropicModel(model string) bool {
 	return false
 }
 
+// rejectAnthropicImageOutput returns an UnsupportedOperation error if the
+// caller asked for image (or other non-text) output. Anthropic Claude models
+// do not generate images today, so we surface that explicitly rather than
+// silently returning text.
+func rejectAnthropicImageOutput(opts *core.GenerateOptions) error {
+	if opts == nil || len(opts.ResponseModalities) == 0 {
+		return nil
+	}
+	for _, m := range opts.ResponseModalities {
+		switch strings.ToLower(strings.TrimSpace(m)) {
+		case "", "text":
+			continue
+		default:
+			return errs.New(errs.UnsupportedOperation, "Anthropic models do not support image output")
+		}
+	}
+	return nil
+}
+
 // Generate implements the core.LLM interface.
 func (a *AnthropicLLM) Generate(ctx context.Context, prompt string, options ...core.GenerateOption) (*core.LLMResponse, error) {
 	logger := logging.GetLogger()
 	opts := core.NewGenerateOptions()
 	for _, opt := range options {
 		opt(opts)
+	}
+
+	if err := rejectAnthropicImageOutput(opts); err != nil {
+		return nil, err
 	}
 
 	normalizedModelID := normalizeModelName(a.ModelID())
@@ -600,6 +623,10 @@ func (a *AnthropicLLM) GenerateWithContent(ctx context.Context, content []core.C
 	opts := core.NewGenerateOptions()
 	for _, opt := range options {
 		opt(opts)
+	}
+
+	if err := rejectAnthropicImageOutput(opts); err != nil {
+		return nil, err
 	}
 
 	// Convert core.ContentBlock to anthropic message params

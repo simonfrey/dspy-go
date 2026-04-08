@@ -19,8 +19,27 @@ type TokenInfo struct {
 
 type LLMResponse struct {
 	Content  string
-	Usage    *TokenInfo
-	Metadata map[string]interface{}
+	// ContentBlocks holds rich multimodal output (text, images, audio).
+	// It is populated by providers that can return non-text outputs (e.g. Gemini
+	// gemini-2.5-flash-image, OpenAI gpt-image-1). Text-only callers may continue
+	// using Content; image-aware callers should iterate ContentBlocks.
+	ContentBlocks []ContentBlock
+	Usage         *TokenInfo
+	Metadata      map[string]interface{}
+}
+
+// ImageBlocks returns only the image content blocks from the response.
+func (r *LLMResponse) ImageBlocks() []ContentBlock {
+	if r == nil {
+		return nil
+	}
+	var out []ContentBlock
+	for _, block := range r.ContentBlocks {
+		if block.Type == FieldTypeImage {
+			out = append(out, block)
+		}
+	}
+	return out
 }
 
 type StreamChunk struct {
@@ -52,6 +71,9 @@ const (
 	CapabilityMultimodal Capability = "multimodal"
 	CapabilityVision     Capability = "vision"
 	CapabilityAudio      Capability = "audio"
+	// CapabilityImageGeneration indicates the model can return images as output
+	// (e.g. gemini-2.5-flash-image, gpt-image-1, dall-e-3).
+	CapabilityImageGeneration Capability = "image-generation"
 )
 
 // It's provider-agnostic - each LLM provider handles its own format conversion.
@@ -138,6 +160,11 @@ type GenerateOptions struct {
 	PresencePenalty  float64
 	FrequencyPenalty float64
 	Stop             []string
+	// ResponseModalities lists the output modalities the caller wants from the
+	// model (e.g. "text", "image", "audio"). Providers that support image
+	// generation use this to enable image output. An empty slice means
+	// text-only (the default behavior).
+	ResponseModalities []string
 }
 
 type EmbeddingOptions struct {
@@ -219,6 +246,16 @@ func WithFrequencyPenalty(p float64) GenerateOption {
 func WithStopSequences(sequences ...string) GenerateOption {
 	return func(o *GenerateOptions) {
 		o.Stop = sequences
+	}
+}
+
+// WithResponseModalities sets the desired output modalities (e.g. "text",
+// "image"). Providers that support image generation will return image bytes in
+// LLMResponse.ContentBlocks when "image" is requested. Providers that do not
+// support a requested modality will return an UnsupportedOperation error.
+func WithResponseModalities(modalities ...string) GenerateOption {
+	return func(o *GenerateOptions) {
+		o.ResponseModalities = modalities
 	}
 }
 

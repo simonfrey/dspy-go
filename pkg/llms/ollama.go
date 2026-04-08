@@ -2,6 +2,7 @@ package llms
 
 import (
 	"context"
+	"encoding/base64"
 	stderrors "errors"
 	"fmt"
 	"net/http"
@@ -297,12 +298,33 @@ func (o *OllamaLLM) generateNative(ctx context.Context, prompt string, options .
 	}
 
 	return &core.LLMResponse{
-		Content: lastResp.Response,
+		Content:       lastResp.Response,
+		ContentBlocks: ollamaContentBlocksFromGenerateResponse(lastResp),
 		Metadata: map[string]interface{}{
 			"model": lastResp.Model,
 			"mode":  "native",
 		},
 	}, nil
+}
+
+// ollamaContentBlocksFromGenerateResponse extracts text and (experimental)
+// image output from an Ollama /api/generate response. The Ollama SDK exposes
+// a base64-encoded Image field on GenerateResponse for image-generation models;
+// when present we decode it and emit an image ContentBlock alongside the text.
+func ollamaContentBlocksFromGenerateResponse(resp ollamaapi.GenerateResponse) []core.ContentBlock {
+	var blocks []core.ContentBlock
+	if resp.Response != "" {
+		blocks = append(blocks, core.NewTextBlock(resp.Response))
+	}
+	if resp.Image != "" {
+		if data, err := base64.StdEncoding.DecodeString(resp.Image); err == nil && len(data) > 0 {
+			blocks = append(blocks, core.NewImageBlock(data, "image/png"))
+		}
+	}
+	if len(blocks) == 0 {
+		return nil
+	}
+	return blocks
 }
 
 // StreamGenerate implements streaming with dual-mode support.
@@ -711,12 +733,34 @@ func (o *OllamaLLM) generateWithContentNative(ctx context.Context, content []cor
 	}
 
 	return &core.LLMResponse{
-		Content: lastResp.Message.Content,
+		Content:       lastResp.Message.Content,
+		ContentBlocks: ollamaContentBlocksFromMessage(lastResp.Message),
 		Metadata: map[string]interface{}{
 			"model": lastResp.Model,
 			"mode":  "native",
 		},
 	}, nil
+}
+
+// ollamaContentBlocksFromMessage extracts text and image output from an Ollama
+// native API message into core.ContentBlock slices. Image bytes are wrapped as
+// FieldTypeImage blocks; the text content is also included so callers iterating
+// ContentBlocks see the full response.
+func ollamaContentBlocksFromMessage(msg ollamaapi.Message) []core.ContentBlock {
+	var blocks []core.ContentBlock
+	if msg.Content != "" {
+		blocks = append(blocks, core.NewTextBlock(msg.Content))
+	}
+	for _, img := range msg.Images {
+		if len(img) == 0 {
+			continue
+		}
+		blocks = append(blocks, core.NewImageBlock([]byte(img), "image/png"))
+	}
+	if len(blocks) == 0 {
+		return nil
+	}
+	return blocks
 }
 
 func (o *OllamaLLM) streamGenerateWithContentNative(ctx context.Context, content []core.ContentBlock, options ...core.GenerateOption) (*core.StreamResponse, error) {
