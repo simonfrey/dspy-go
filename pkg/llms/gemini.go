@@ -228,7 +228,7 @@ func NewGeminiLLM(apiKey string, model core.ModelID) (*GeminiLLM, error) {
 			errors.Fields{"model": model})
 	}
 	endpoint := &core.EndpointConfig{
-		BaseURL: "https://generativelanguage.googleapis.com/v1beta",
+		BaseURL: "https://generativelanguage.googleapis.com",
 		Path:    fmt.Sprintf("/models/%s:generateContent", model),
 		Headers: map[string]string{
 			"Content-Type": "application/json",
@@ -270,7 +270,7 @@ func NewGeminiLLMFromConfig(ctx context.Context, config core.ProviderConfig, mod
 	}
 
 	// Create endpoint configuration
-	baseURL := "https://generativelanguage.googleapis.com/v1beta"
+	baseURL := "https://generativelanguage.googleapis.com"
 	if config.BaseURL != "" {
 		baseURL = config.BaseURL
 	}
